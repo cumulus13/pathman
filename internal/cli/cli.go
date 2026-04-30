@@ -21,7 +21,9 @@ var (
 	scope    string
 	dryRun   bool
 	noColor  bool
+	format   string  // Added: output format
 )
+
 
 // Execute runs the CLI application
 func Execute() error {
@@ -30,27 +32,24 @@ func Execute() error {
 
 func init() {
 	manager = env.NewManager(false)
-	
+
 	rootCmd = &cobra.Command{
 		Use:   "pathman",
 		Short: "🗺️  Professional Windows Environment Variable Manager",
-		Long: fmt.Sprintf(`%s
-PathMan - A modern, professional Windows environment variable manager
+		Long: `🌍 PathMan - Environment Variable Manager
 
-%s Manage PATH and other environment variables with ease.
-Supports both User and System scopes with colorful, intuitive output.
+A modern, professional Windows environment variable manager.
+Manage PATH and other environment variables with ease.
+Shows both User and System scopes by default.
 
-%s Features:
+Features:
   • Add, remove, and list PATH entries
   • Set, get, and delete environment variables
   • User and System scope management
   • Duplicate detection and cleanup
   • Non-existent path validation
-  • Dry-run mode for safe testing`,
-			ui.HeaderInfo("🌍 PathMan - Environment Variable Manager"),
-			ui.Info,
-			ui.Dim,
-		),
+  • Dry-run mode for safe testing
+  • JSON, YAML, CSV output formats`,
 		Version: "1.0.0",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			if noColor {
@@ -58,11 +57,12 @@ Supports both User and System scopes with colorful, intuitive output.
 			}
 		},
 	}
-	
-	rootCmd.PersistentFlags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
+
+	rootCmd.PersistentFlags().StringVarP(&scope, "scope", "s", "both", "Scope: user, system, or both")
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would be done without making changes")
 	rootCmd.PersistentFlags().BoolVar(&noColor, "no-color", false, "Disable colored output")
-	
+	rootCmd.PersistentFlags().StringVarP(&format, "format", "f", "text", "Output format: text, json, yaml, csv")
+
 	rootCmd.AddCommand(getCmd())
 	rootCmd.AddCommand(setCmd())
 	rootCmd.AddCommand(deleteCmd())
@@ -76,9 +76,15 @@ func parseScope() env.Scope {
 	switch strings.ToLower(scope) {
 	case "system", "machine", "global":
 		return env.ScopeSystem
+	case "both", "all", "":
+		return env.ScopeUser  // Default, but handled in list command
 	default:
 		return env.ScopeUser
 	}
+}
+
+func isBothScopes() bool {
+	return strings.ToLower(scope) == "both" || strings.ToLower(scope) == "all"
 }
 
 func getCmd() *cobra.Command {
@@ -86,24 +92,168 @@ func getCmd() *cobra.Command {
 		Use:     "get [variable]",
 		Aliases: []string{"g", "show", "value"},
 		Short:   fmt.Sprintf("%s Get environment variable value", ui.IconSearch),
-		Long:    "Retrieve and display the value of an environment variable",
+		Long:    "Retrieve and display the value of an environment variable from user, system, or both scopes",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
+			scopeStr := strings.ToLower(scope)
+
+			// Handle output format
+			if format != "text" {
+				return getFormattedOutput(m, args[0], scopeStr, format)
+			}
+
+			// Show both scopes (text mode)
+			if scopeStr != "user" && scopeStr != "system" && scopeStr != "machine" && scopeStr != "global" {
+				fmt.Printf("\n%s %s - Both Scopes\n", ui.IconSearch, ui.Highlight(args[0]))
+				fmt.Println(strings.Repeat("═", 80))
+				
+				// User scope
+				userVar, err := m.Get(args[0], env.ScopeUser)
+				if err != nil {
+					fmt.Printf("%s %s: %s\n", ui.IconUser, ui.Dim("User"), ui.Error(fmt.Sprintf("Not found (%v)", err)))
+				} else {
+					fmt.Printf("%s %s:\n", ui.IconUser, ui.HeaderInfo("User"))
+					fmt.Printf("  %s\n", ui.Path(userVar.Value))
+				}
+				
+				fmt.Println()
+				
+				// System scope
+				sysVar, err := m.Get(args[0], env.ScopeSystem)
+				if err != nil {
+					fmt.Printf("%s %s: %s\n", ui.IconSystem, ui.Dim("System"), ui.Error(fmt.Sprintf("Not found (%v)", err)))
+				} else {
+					fmt.Printf("%s %s:\n", ui.IconSystem, ui.HeaderInfo("System"))
+					fmt.Printf("  %s\n", ui.Path(sysVar.Value))
+				}
+				
+				return nil
+			}
+
+			// Single scope (text mode)
 			scopeType := parseScope()
-			
 			v, err := m.Get(args[0], scopeType)
 			if err != nil {
 				fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
 				return err
 			}
-			
-			fmt.Printf("\n%s %s\n", ui.GetScopeIcon(scope), ui.Highlight(v.Name))
-			fmt.Printf("%s %s\n", ui.IconLink, ui.Path(v.Value))
-			
+
+			fmt.Printf("\n%s %s (%s)\n", ui.GetScopeIcon(scope), ui.Highlight(v.Name), ui.Dim(scopeType.String()))
+			fmt.Printf("  %s\n", ui.Path(v.Value))
+
 			return nil
 		},
 	}
+}
+
+// getFormattedOutput handles non-text output formats
+func getFormattedOutput(m *env.Manager, varName, scopeStr, format string) error {
+	switch strings.ToLower(format) {
+	case "json":
+		return outputJSON(m, varName, scopeStr)
+	case "csv":
+		return outputCSV(m, varName, scopeStr)
+	case "yaml", "yml":
+		return outputYAML(m, varName, scopeStr)
+	default:
+		return fmt.Errorf("unsupported format: %s (use: text, json, yaml, csv)", format)
+	}
+}
+
+func outputJSON(m *env.Manager, varName, scopeStr string) error {
+	var allVars []env.Variable
+	
+	if scopeStr == "user" {
+		v, err := m.Get(varName, env.ScopeUser)
+		if err != nil {
+			return err
+		}
+		allVars = append(allVars, *v)
+	} else if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
+		v, err := m.Get(varName, env.ScopeSystem)
+		if err != nil {
+			return err
+		}
+		allVars = append(allVars, *v)
+	} else {
+		// Both scopes
+		if v, err := m.Get(varName, env.ScopeUser); err == nil {
+			allVars = append(allVars, *v)
+		}
+		if v, err := m.Get(varName, env.ScopeSystem); err == nil {
+			allVars = append(allVars, *v)
+		}
+	}
+	
+	jsonStr, err := env.VariablesToJSON(allVars, scopeStr)
+	if err != nil {
+		return err
+	}
+	
+	fmt.Print(jsonStr)
+	return nil
+}
+
+func outputYAML(m *env.Manager, varName, scopeStr string) error {
+	var allVars []env.Variable
+	
+	if scopeStr == "user" {
+		v, err := m.Get(varName, env.ScopeUser)
+		if err != nil {
+			return err
+		}
+		allVars = append(allVars, *v)
+	} else if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
+		v, err := m.Get(varName, env.ScopeSystem)
+		if err != nil {
+			return err
+		}
+		allVars = append(allVars, *v)
+	} else {
+		if v, err := m.Get(varName, env.ScopeUser); err == nil {
+			allVars = append(allVars, *v)
+		}
+		if v, err := m.Get(varName, env.ScopeSystem); err == nil {
+			allVars = append(allVars, *v)
+		}
+	}
+	
+	fmt.Print(env.VariablesToYAML(allVars))
+	return nil
+}
+
+func outputCSV(m *env.Manager, varName, scopeStr string) error {
+	var allVars []env.Variable
+	
+	if scopeStr == "user" {
+		v, err := m.Get(varName, env.ScopeUser)
+		if err != nil {
+			return err
+		}
+		allVars = append(allVars, *v)
+	} else if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
+		v, err := m.Get(varName, env.ScopeSystem)
+		if err != nil {
+			return err
+		}
+		allVars = append(allVars, *v)
+	} else {
+		if v, err := m.Get(varName, env.ScopeUser); err == nil {
+			allVars = append(allVars, *v)
+		}
+		if v, err := m.Get(varName, env.ScopeSystem); err == nil {
+			allVars = append(allVars, *v)
+		}
+	}
+	
+	csvStr, err := env.VariablesToCSV(allVars)
+	if err != nil {
+		return err
+	}
+	
+	fmt.Print(csvStr)
+	return nil
 }
 
 func setCmd() *cobra.Command {
@@ -187,45 +337,221 @@ func deleteCmd() *cobra.Command {
 	}
 }
 
+func listFormattedOutput(m *env.Manager, scopeStr, format string) error {
+	var allVars []env.Variable
+	
+	if scopeStr == "user" {
+		vars, err := m.List(env.ScopeUser)
+		if err != nil {
+			return err
+		}
+		allVars = vars
+	} else if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
+		vars, err := m.List(env.ScopeSystem)
+		if err != nil {
+			return err
+		}
+		allVars = vars
+	} else {
+		userVars, _ := m.List(env.ScopeUser)
+		sysVars, _ := m.List(env.ScopeSystem)
+		allVars = append(userVars, sysVars...)
+	}
+	
+	switch strings.ToLower(format) {
+	case "json":
+		jsonStr, err := env.VariablesToJSON(allVars, scopeStr)
+		if err != nil {
+			return err
+		}
+		fmt.Print(jsonStr)
+	case "yaml", "yml":
+		fmt.Print(env.VariablesToYAML(allVars))
+	case "csv":
+		csvStr, err := env.VariablesToCSV(allVars)
+		if err != nil {
+			return err
+		}
+		fmt.Print(csvStr)
+	default:
+		return fmt.Errorf("unsupported format: %s", format)
+	}
+	
+	return nil
+}
+
 func listCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"l", "ls", "all"},
 		Short:   fmt.Sprintf("%s List all environment variables", ui.IconList),
-		Long:    "Display all environment variables in the specified scope",
+		Long:    "Display all environment variables (default: both user and system)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
-			scopeType := parseScope()
-			
-			vars, err := m.List(scopeType)
-			if err != nil {
-				fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
-				return err
+			scopeStr := strings.ToLower(scope)
+
+			// Handle non-text formats
+			if format != "text" {
+				return listFormattedOutput(m, scopeStr, format)
 			}
-			
-			fmt.Printf("\n%s %s Environment Variables:\n", 
-				ui.GetScopeIcon(scope), 
-				ui.HeaderInfo(scopeType.String()),
-			)
-			fmt.Println(strings.Repeat("─", 80))
-			
-			for _, v := range vars {
-				value := v.Value
-				if len(value) > 60 {
-					value = value[:57] + "..."
+
+			if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
+				return printVarList(m, env.ScopeSystem)
+			} else if scopeStr == "user" {
+				return printVarList(m, env.ScopeUser)
+			} else {
+				// DEFAULT: Show both with nice header
+				fmt.Printf("\n%s Environment Variables - Both Scopes\n", ui.HeaderInfo("🌍"))
+				fmt.Println(strings.Repeat("═", 80))
+				
+				userVars, err := m.List(env.ScopeUser)
+				if err != nil {
+					return err
 				}
-				fmt.Printf("  %s %s %s\n",
-					ui.KeyValue(v.Name),
-					ui.Dim("="),
-					ui.Path(value),
-				)
+				sysVars, err := m.List(env.ScopeSystem)
+				if err != nil {
+					return err
+				}
+				
+				printVarSection(ui.IconUser, "User", userVars)
+				fmt.Println()
+				printVarSection(ui.IconSystem, "System", sysVars)
+				
+				total := len(userVars) + len(sysVars)
+				fmt.Printf("\n%s %s\n", ui.IconCheck, ui.Dim(fmt.Sprintf("Total: %d variables (User + System)", total)))
+				return nil
 			}
-			
-			fmt.Printf("\n%s %s\n", ui.IconCheck, ui.Dim(fmt.Sprintf("Total: %d variables", len(vars))))
-			
-			return nil
 		},
 	}
+}
+
+func printVarSection(icon string, title string, vars []env.Variable) {
+	fmt.Printf("\n%s %s Environment Variables:\n", icon, ui.HeaderInfo(title))
+	fmt.Println(strings.Repeat("─", 80))
+	
+	// Find max length for alignment
+	maxLen := 22 // minimum padding
+	for _, v := range vars {
+		if len(v.Name) > maxLen {
+			maxLen = len(v.Name)
+		}
+	}
+	maxLen += 3 // extra padding
+	
+	for _, v := range vars {
+		value := v.Value
+		if len(value) > 60 {
+			value = value[:57] + "..."
+		}
+		padding := strings.Repeat(" ", maxLen-len(v.Name))
+		fmt.Printf("  %s%s %s %s\n", ui.KeyValue(v.Name), padding, ui.Dim("="), ui.Path(value))
+	}
+	
+	fmt.Printf("  %s %s\n", ui.Dim(strings.Repeat("─", 78)), ui.Dim(fmt.Sprintf("%s: %d variables", title, len(vars))))
+}
+
+func printVarList(m *env.Manager, scopeType env.Scope) error {
+	vars, err := m.List(scopeType)
+	if err != nil {
+		fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
+		return err
+	}
+
+	icon := ui.IconUser
+	title := "User"
+	if scopeType == env.ScopeSystem {
+		icon = ui.IconSystem
+		title = "System"
+	}
+
+	printVarSection(icon, title, vars)
+	return nil
+}
+
+func showSingleScope(m *env.Manager, scopeType env.Scope) error {
+	vars, err := m.List(scopeType)
+	if err != nil {
+		fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
+		return err
+	}
+
+	fmt.Printf("\n%s %s Environment Variables:\n",
+		ui.GetScopeIcon(scope),
+		ui.HeaderInfo(scopeType.String()),
+	)
+	fmt.Println(strings.Repeat("─", 80))
+
+	for _, v := range vars {
+		value := v.Value
+		if len(value) > 60 {
+			value = value[:57] + "..."
+		}
+		fmt.Printf("  %-30s = %s\n",
+			ui.KeyValue(v.Name),
+			ui.Path(value),
+		)
+	}
+
+	fmt.Printf("\n%s %s\n", ui.IconCheck, ui.Dim(fmt.Sprintf("Total: %d variables", len(vars))))
+	return nil
+}
+
+func showBothScopes(m *env.Manager) error {
+	fmt.Printf("\n%s Environment Variables - Both Scopes\n", ui.HeaderInfo("🌍"))
+	fmt.Println(strings.Repeat("═", 80))
+
+	totalVars := 0
+
+	// Get user variables
+	userVars, err := m.List(env.ScopeUser)
+	if err != nil {
+		fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error reading user variables: %v", err)))
+	} else {
+		fmt.Printf("\n%s %s Environment Variables:\n",
+			ui.IconUser,
+			ui.HeaderInfo("User"),
+		)
+		fmt.Println(strings.Repeat("─", 80))
+		for _, v := range userVars {
+			value := v.Value
+			if len(value) > 60 {
+				value = value[:57] + "..."
+			}
+			fmt.Printf("  %-30s = %s\n",
+				ui.KeyValue(v.Name),
+				ui.Path(value),
+			)
+		}
+		totalVars += len(userVars)
+		fmt.Printf("  %s %s\n", ui.Dim(strings.Repeat("─", 78)), ui.Dim(fmt.Sprintf("User: %d variables", len(userVars))))
+	}
+
+	// Get system variables
+	sysVars, err := m.List(env.ScopeSystem)
+	if err != nil {
+		fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error reading system variables: %v", err)))
+	} else {
+		fmt.Printf("\n%s %s Environment Variables:\n",
+			ui.IconSystem,
+			ui.HeaderInfo("System"),
+		)
+		fmt.Println(strings.Repeat("─", 80))
+		for _, v := range sysVars {
+			value := v.Value
+			if len(value) > 60 {
+				value = value[:57] + "..."
+			}
+			fmt.Printf("  %-30s = %s\n",
+				ui.KeyValue(v.Name),
+				ui.Path(value),
+			)
+		}
+		totalVars += len(sysVars)
+		fmt.Printf("  %s %s\n", ui.Dim(strings.Repeat("─", 78)), ui.Dim(fmt.Sprintf("System: %d variables", len(sysVars))))
+	}
+
+	fmt.Printf("\n%s %s\n", ui.IconCheck, ui.Dim(fmt.Sprintf("Total: %d variables (User + System)", totalVars)))
+	return nil
 }
 
 func pathCmd() *cobra.Command {
@@ -247,14 +573,12 @@ func pathCmd() *cobra.Command {
 				m := env.NewManager(dryRun)
 				scopeType := parseScope()
 				
-				// Resolve to absolute path
 				absPath, err := filepath.Abs(args[0])
 				if err != nil {
 					fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error resolving path: %v", err)))
 					return err
 				}
 				
-				// Check if path exists
 				if _, err := os.Stat(absPath); os.IsNotExist(err) {
 					fmt.Printf("%s %s\n", ui.IconWarning, ui.Warning(fmt.Sprintf("Warning: Path does not exist: %s", absPath)))
 				}
@@ -416,20 +740,20 @@ func infoCmd() *cobra.Command {
 		Short:   fmt.Sprintf("%s Show environment information", ui.IconInfo),
 		Long:    "Display current environment configuration and paths",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("\n%s PathMan v1.0.0\n", ui.IconRocket)
+			fmt.Printf("\n%s PathMan v.1.0.1\n", ui.IconRocket)
 			fmt.Println(strings.Repeat("═", 60))
 			
 			fmt.Printf("\n%s %s\n", ui.IconGear, ui.HeaderInfo("System Info"))
-			fmt.Printf("  %s %s\n", ui.IconUser, ui.Info("User:"), os.Getenv("USERNAME"))
-			fmt.Printf("  %s %s\n", ui.IconSystem, ui.Info("Computer:"), os.Getenv("COMPUTERNAME"))
-			fmt.Printf("  %s %s\n", ui.IconFolder, ui.Info("Home:"), os.Getenv("USERPROFILE"))
-			fmt.Printf("  %s %s\n", ui.IconGear, ui.Info("OS:"), os.Getenv("OS"))
+			fmt.Printf("  %s %s %s\n", ui.IconUser, ui.Info("User:"), os.Getenv("USERNAME"))
+			fmt.Printf("  %s %s %s\n", ui.IconSystem, ui.Info("Computer:"), os.Getenv("COMPUTERNAME"))
+			fmt.Printf("  %s %s %s\n", ui.IconFolder, ui.Info("Home:"), os.Getenv("USERPROFILE"))
+			fmt.Printf("  %s %s %s\n", ui.IconGear, ui.Info("OS:"), os.Getenv("OS"))
 			
 			fmt.Printf("\n%s %s\n", ui.IconStar, ui.HeaderInfo("Important Paths"))
-			fmt.Printf("  %s %s\n", ui.IconFolder, ui.Info("System Root:"), os.Getenv("SystemRoot"))
-			fmt.Printf("  %s %s\n", ui.IconFolder, ui.Info("Program Files:"), os.Getenv("ProgramFiles"))
-			fmt.Printf("  %s %s\n", ui.IconFolder, ui.Info("AppData:"), os.Getenv("APPDATA"))
-			fmt.Printf("  %s %s\n", ui.IconFolder, ui.Info("Temp:"), os.Getenv("TEMP"))
+			fmt.Printf("  %s %s %s\n", ui.IconFolder, ui.Info("System Root:"), os.Getenv("SystemRoot"))
+			fmt.Printf("  %s %s %s\n", ui.IconFolder, ui.Info("Program Files:"), os.Getenv("ProgramFiles"))
+			fmt.Printf("  %s %s %s\n", ui.IconFolder, ui.Info("AppData:"), os.Getenv("APPDATA"))
+			fmt.Printf("  %s %s %s\n", ui.IconFolder, ui.Info("Temp:"), os.Getenv("TEMP"))
 			
 			fmt.Printf("\n%s %s\n", ui.IconInfo, ui.Dim("Use 'pathman --help' for available commands"))
 			

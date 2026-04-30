@@ -65,6 +65,34 @@ pathman path list -s system
 # Clean up PATH (remove duplicates and invalid paths)
 pathman clean
 pathman clean -s system --dry-run  # Preview changes
+
+# Get single variable as JSON
+pathman get PATH --format json
+pathman get JAVA_HOME -f json
+
+# Get from specific scope as JSON
+pathman get PATH --scope user --format json
+pathman get PATH --scope system -f json
+
+# Get as YAML
+pathman get PATH -f yaml
+
+# Get as CSV
+pathman get PATH -f csv
+
+# List all variables as JSON
+pathman list -f json
+
+# List system only as JSON
+pathman list --scope system -f json
+
+# Export to file
+pathman list -f json > env_vars.json
+pathman list -f csv > env_vars.csv
+pathman get PATH -f json > path.json
+
+# Pretty print with jq (if installed)
+pathman list -f json | jq .
 ```
 
 ### Flags

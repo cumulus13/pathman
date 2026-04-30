@@ -1,0 +1,27 @@
+*.pyc
+*.bak
+*.zip
+*.rar
+*.7z
+*.mp3
+*.wav
+*.sublime-workspace
+.hg/
+build/
+*.hgignore
+*.hgtags
+*dist/
+*.egg-info/
+traceback.log
+__pycache__/
+*.log
+*sublime*
+*.exe
+temp/
+bin/
+obj/
+
+# Added entries (1 items)
+CONVERSATIONS.md
+# PT backup directory
+.pt/

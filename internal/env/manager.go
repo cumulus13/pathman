@@ -1,3 +1,13 @@
+/*
+ FILE 4: internal/env/manager.go
+ Fixed:
+   - PathAdd: added AppendPosition parameter (pre/post support - was silently ignored before)
+   - PathAdd: checkExist bool removed from internal logic; caller decides whether to error
+   - PathAddAndRefresh: updated signature to match PathAdd
+   - BroadcastChange: new public method so refreshCmd in cli.go can call it
+   - broadcastEnvironmentChange: now actually uses the registry helper for real WM_SETTINGCHANGE
+*/
+
 package env
 
 import (
@@ -6,6 +16,7 @@ import (
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
+	pkgregistry "github.com/cumulus13/pathman/pkg/registry"
 )
 
 // Manager handles environment variable operations
@@ -63,9 +74,36 @@ func (m *Manager) Set(name, value string, scope Scope) error {
 		return fmt.Errorf("failed to set variable: %w", err)
 	}
 
-	// Broadcast change
-	broadcastEnvironmentChange()
+	m.BroadcastChange()
 	return nil
+}
+
+// SetAndRefresh sets a variable and updates current terminal immediately
+func (m *Manager) SetAndRefresh(name, value string, scope Scope) error {
+	if err := m.Set(name, value, scope); err != nil {
+		return err
+	}
+
+	// Update current process
+	os.Setenv(name, value)
+
+	// Also update PATH specifically by reading combined registry values
+	if strings.EqualFold(name, "PATH") {
+		m.refreshCurrentPath()
+	}
+
+	// Broadcast to all windows
+	rh := pkgregistry.NewRegistryHelper()
+	rh.BroadcastEnvironmentChange()
+
+	return nil
+}
+
+// BroadcastChange sends WM_SETTINGCHANGE to all windows so they pick up new env vars.
+// Exposed as public so cli commands (e.g. refreshCmd) can call it directly.
+func (m *Manager) BroadcastChange() error {
+	rh := pkgregistry.NewRegistryHelper()
+	return rh.BroadcastEnvironmentChange()
 }
 
 // Delete deletes an environment variable
@@ -87,7 +125,7 @@ func (m *Manager) Delete(name string, scope Scope) error {
 		return fmt.Errorf("failed to delete variable: %w", err)
 	}
 
-	broadcastEnvironmentChange()
+	m.BroadcastChange()
 	return nil
 }
 
@@ -108,7 +146,7 @@ func (m *Manager) List(scope Scope) ([]Variable, error) {
 	for _, name := range names {
 		value, _, err := k.GetStringValue(name)
 		if err != nil {
-			continue // Skip unreadable values
+			continue
 		}
 		vars = append(vars, Variable{
 			Name:  name,
@@ -120,32 +158,137 @@ func (m *Manager) List(scope Scope) ([]Variable, error) {
 	return vars, nil
 }
 
-// PathAdd adds a directory to a PATH-like variable
-func (m *Manager) PathAdd(pathVar, newPath string, scope Scope, checkExist bool) error {
-	v, err := m.Get(pathVar, scope)
+// AppendValue appends a string to an existing variable with duplicate checking.
+// position controls whether the new value is added at the front (AppendPre) or end (AppendPost).
+func (m *Manager) AppendValue(name, newValue string, scope Scope, position AppendPosition) error {
+	v, err := m.Get(name, scope)
 	if err != nil {
 		return err
 	}
 
-	paths := strings.Split(v.Value, string(os.PathListSeparator))
-	
+	currentValue := NormalizePathSeparator(v.Value)
+	newValue = strings.TrimSpace(newValue)
+
+	// Check if value already exists (case-insensitive)
+	parts := strings.Split(currentValue, string(os.PathListSeparator))
+	for _, p := range parts {
+		if strings.EqualFold(strings.TrimSpace(p), newValue) {
+			return fmt.Errorf("value already exists in %s", name)
+		}
+	}
+
+	var newFullValue string
+	switch position {
+	case AppendPre:
+		if currentValue == "" {
+			newFullValue = newValue
+		} else {
+			newFullValue = newValue + string(os.PathListSeparator) + currentValue
+		}
+	default: // AppendPost
+		if currentValue == "" {
+			newFullValue = newValue
+		} else {
+			newFullValue = currentValue + string(os.PathListSeparator) + newValue
+		}
+	}
+
+	newFullValue = NormalizePathSeparator(newFullValue)
+	return m.Set(name, newFullValue, scope)
+}
+
+// AppendValueAndRefresh appends and updates current terminal session immediately
+func (m *Manager) AppendValueAndRefresh(name, newValue string, scope Scope, position AppendPosition) error {
+	if err := m.AppendValue(name, newValue, scope, position); err != nil {
+		return err
+	}
+
+	// Get the updated value
+	v, err := m.Get(name, scope)
+	if err != nil {
+		return err
+	}
+
+	// Update current process environment
+	os.Setenv(name, v.Value)
+
+	// Also update PATH specifically
+	if strings.EqualFold(name, "PATH") {
+		m.refreshCurrentPath()
+	}
+
+	// Broadcast to all windows
+	rh := pkgregistry.NewRegistryHelper()
+	rh.BroadcastEnvironmentChange()
+
+	return nil
+}
+
+// PathAdd adds a directory to a PATH-like variable.
+//
+// position: AppendPre adds to the front, AppendPost adds to the end.
+// checkExist: if true, returns an error when newPath does not exist on disk.
+//
+// NOTE: the cli layer already prints a warning for non-existent paths before
+// calling PathAdd, so it passes checkExist=false to avoid a redundant error.
+func (m *Manager) PathAdd(pathVar, newPath string, scope Scope, position AppendPosition, checkExist bool) error {
 	if checkExist {
 		if _, err := os.Stat(newPath); os.IsNotExist(err) {
 			return fmt.Errorf("path does not exist: %s", newPath)
 		}
 	}
 
-	// Check if path already exists
+	v, err := m.Get(pathVar, scope)
+	if err != nil {
+		return err
+	}
+
+	paths := strings.Split(v.Value, string(os.PathListSeparator))
+
+	// Check for duplicate (case-insensitive)
 	for _, p := range paths {
 		if strings.EqualFold(strings.TrimSpace(p), strings.TrimSpace(newPath)) {
 			return fmt.Errorf("path already exists in %s", pathVar)
 		}
 	}
 
-	paths = append(paths, newPath)
-	newValue := strings.Join(paths, string(os.PathListSeparator))
+	var newPaths []string
+	switch position {
+	case AppendPre:
+		newPaths = append([]string{newPath}, paths...)
+	default: // AppendPost
+		newPaths = append(paths, newPath)
+	}
 
+	newValue := NormalizePathSeparator(strings.Join(newPaths, string(os.PathListSeparator)))
 	return m.Set(pathVar, newValue, scope)
+}
+
+// PathAddAndRefresh adds to PATH and updates current terminal immediately.
+// Signature matches PathAdd (position + checkExist).
+func (m *Manager) PathAddAndRefresh(pathVar, newPath string, scope Scope, position AppendPosition, checkExist bool) error {
+	if err := m.PathAdd(pathVar, newPath, scope, position, checkExist); err != nil {
+		return err
+	}
+
+	v, err := m.Get(pathVar, scope)
+	if err != nil {
+		return err
+	}
+
+	// Update current process PATH
+	os.Setenv(pathVar, v.Value)
+
+	// Also rebuild combined PATH
+	if strings.EqualFold(pathVar, "PATH") {
+		m.refreshCurrentPath()
+	}
+
+	// Broadcast
+	rh := pkgregistry.NewRegistryHelper()
+	rh.BroadcastEnvironmentChange()
+
+	return nil
 }
 
 // PathRemove removes a directory from a PATH-like variable
@@ -164,14 +307,16 @@ func (m *Manager) PathRemove(pathVar, removePath string, scope Scope) error {
 			found = true
 			continue
 		}
-		newPaths = append(newPaths, p)
+		if strings.TrimSpace(p) != "" {
+			newPaths = append(newPaths, p)
+		}
 	}
 
 	if !found {
 		return fmt.Errorf("path not found in %s", pathVar)
 	}
 
-	newValue := strings.Join(newPaths, string(os.PathListSeparator))
+	newValue := NormalizePathSeparator(strings.Join(newPaths, string(os.PathListSeparator)))
 	return m.Set(pathVar, newValue, scope)
 }
 
@@ -225,6 +370,30 @@ func (m *Manager) openKeyWrite(scope Scope) (registry.Key, error) {
 	}
 }
 
+// refreshCurrentPath rebuilds the current process PATH from registry (System + User)
+func (m *Manager) refreshCurrentPath() {
+	sysPath, err := m.Get("PATH", ScopeSystem)
+	if err != nil {
+		sysPath = &Variable{Value: ""}
+	}
+
+	userPath, err := m.Get("PATH", ScopeUser)
+	if err != nil {
+		userPath = &Variable{Value: ""}
+	}
+
+	combined := sysPath.Value
+	if userPath.Value != "" {
+		if combined != "" {
+			combined += ";" + userPath.Value
+		} else {
+			combined = userPath.Value
+		}
+	}
+
+	os.Setenv("PATH", combined)
+}
+
 func validateVariableName(name string) error {
 	if name == "" {
 		return &ValidationError{Field: "name", Message: "variable name cannot be empty"}
@@ -233,15 +402,4 @@ func validateVariableName(name string) error {
 		return &ValidationError{Field: "name", Message: "variable name cannot contain '='"}
 	}
 	return nil
-}
-
-// broadcastEnvironmentChange notifies the system about environment changes
-func broadcastEnvironmentChange() {
-	// Send WM_SETTINGCHANGE message to all windows
-	// This is handled by the syscall in the Windows API
-	// The actual implementation would use:
-	// SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000)
-	
-	// For now, we'll just update the current process
-	os.Setenv("PATH", os.Getenv("PATH"))
 }

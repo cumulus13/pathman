@@ -1,15 +1,17 @@
 /*
- FILE: internal/cli/cli.go
+ FILE: internal/cli/cli.go  (v3 — wildcard/pattern support)
 
- Changes from original:
-   1. Per-command local flag variables — no package-level scope/refresh/position/clipboard
-      shared state that caused wrong defaults and cross-command pollution.
-   2. path add/remove/list now properly register -s, -r, -p, -c flags on themselves.
-   3. setCmd: removed fragile string-stripping hack; cobra parses flags correctly before RunE.
-   4. PathAdd / PathAddAndRefresh: new signature passes AppendPosition and checkExist=false.
-   5. Added -c/--clipboard flag to: get, set, append, list, path add, path list, parse.
-   6. Added top-level "refresh" command.
-   7. remove-value -r: uses SetAndRefresh (broadcasts WM_SETTINGCHANGE) not bare os.Setenv.
+ Changes from v2:
+   - New internal/pattern package (match.go) provides glob + regex matching.
+   - get:          accepts glob/regex pattern -> shows all matching variables.
+   - delete:       accepts glob/regex pattern -> deletes all matching (--confirm required for multi-match).
+   - list:         --filter/-F glob/regex on variable names and/or values.
+   - path list:    --filter/-F glob/regex on path entries.
+   - path remove:  accepts glob/regex pattern -> removes all matching PATH entries.
+   - remove-value: value arg accepts glob/regex pattern.
+   - parse:        accepts glob/regex pattern -> formats all matching variables.
+   - All pattern commands accept --regex/-R flag for regex mode (default: glob).
+   - Auto-detect: if arg contains * ? [ it is treated as a glob automatically.
 */
 
 package cli
@@ -26,6 +28,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/cumulus13/pathman/internal/env"
+	"github.com/cumulus13/pathman/internal/pattern"
 	"github.com/cumulus13/pathman/internal/ui"
 )
 
@@ -41,7 +44,6 @@ func Execute() error {
 	return rootCmd.Execute()
 }
 
-// copyToClipboard pipes text into the Windows built-in "clip" command.
 func copyToClipboard(text string) error {
 	cmd := exec.Command("clip")
 	cmd.Stdin = bytes.NewBufferString(text)
@@ -60,21 +62,34 @@ func init() {
 
 A modern, professional Windows environment variable manager.
 Manage PATH and other environment variables with ease.
-Shows both User and System scopes by default.
 
 Features:
   • Add, remove, and list PATH entries
   • Set, get, and delete environment variables
   • Append to variables with pre/post position
   • User and System scope management
+  • Wildcard/glob and regex pattern matching
   • Duplicate detection and cleanup
   • Non-existent path validation
   • JSON, YAML, CSV, Table output formats
   • Dry-run mode for safe testing
   • Clipboard copy with -c/--clipboard
   • Instant terminal refresh with -r/--refresh
-        Flags work before OR after the value:
-        pathman append PATH "val" -s system -r -c`,
+  • Temporary (current session only) with --temp
+
+Pattern syntax (default: glob, case-insensitive):
+  *          any sequence of characters
+  ?          any single character
+  [abc]      character class
+  --regex    switch to full regex (Go regexp, case-insensitive by default)
+
+Examples:
+  pathman get "JAVA*"
+  pathman get "*HOME*" -s system
+  pathman delete "TEMP_*" --confirm
+  pathman list --filter "*PATH*"
+  pathman path list --filter "C:\Python*"
+  pathman path remove "C:\Python3[78]*" --regex`,
 		Version: "1.0.0",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			if noColor {
@@ -110,46 +125,118 @@ func positionFromString(s string) env.AppendPosition {
 	}
 }
 
+// matchVars returns all variables in scope whose names match pat.
+// If pat has no glob chars and useRegex is false, it tries exact match first,
+// then falls back to a contains match so "PATH" still finds "PATH" directly.
+func matchVars(m *env.Manager, pat string, scope env.Scope, useRegex bool) ([]env.Variable, error) {
+	if !pattern.IsPattern(pat) && !useRegex {
+		// Plain literal: get exactly that variable
+		v, err := m.Get(pat, scope)
+		if err != nil {
+			return nil, err
+		}
+		return []env.Variable{*v}, nil
+	}
+	// Pattern: scan all variables in scope
+	vars, err := m.List(scope)
+	if err != nil {
+		return nil, err
+	}
+	var matched []env.Variable
+	for _, v := range vars {
+		ok, err := pattern.Match(pat, v.Name, useRegex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid pattern %q: %w", pat, err)
+		}
+		if ok {
+			matched = append(matched, v)
+		}
+	}
+	return matched, nil
+}
+
+// matchBothScopes runs matchVars for both user and system scopes.
+func matchBothScopes(m *env.Manager, pat string, useRegex bool) ([]env.Variable, error) {
+	user, err := matchVars(m, pat, env.ScopeUser, useRegex)
+	if err != nil {
+		return nil, err
+	}
+	sys, err := matchVars(m, pat, env.ScopeSystem, useRegex)
+	if err != nil {
+		return nil, err
+	}
+	return append(user, sys...), nil
+}
+
 // ─── get ────────────────────────────────────────────────────────────────────
 
 func getCmd() *cobra.Command {
 	var scope string
 	var clipboard bool
+	var useRegex bool
 
 	cmd := &cobra.Command{
-		Use:     "get [variable]",
+		Use:     "get [variable|pattern]",
 		Aliases: []string{"g", "show", "value"},
 		Short:   fmt.Sprintf("%s Get environment variable value", ui.IconSearch),
-		Long:    "Retrieve and display the value of an environment variable. Use -c to copy value to clipboard.",
-		Args:    cobra.ExactArgs(1),
+		Long: `Retrieve and display the value of an environment variable.
+Accepts glob patterns (* ? [abc]) or --regex for full regex.
+If the pattern matches multiple variables, all are shown.
+
+Examples:
+  pathman get PATH
+  pathman get "JAVA*"
+  pathman get "*HOME*" -s system
+  pathman get "^PYTHON" --regex`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
-			scopeType := scopeFromString(scope)
-			v, err := m.Get(args[0], scopeType)
+			pat := args[0]
+
+			// Determine scope(s) to search
+			var vars []env.Variable
+			var err error
+			if strings.ToLower(scope) == "both" {
+				vars, err = matchBothScopes(m, pat, useRegex)
+			} else {
+				vars, err = matchVars(m, pat, scopeFromString(scope), useRegex)
+			}
 			if err != nil {
 				fmt.Printf("%s %s\n", ui.IconError, ui.Error(err.Error()))
 				return err
 			}
-			if clipboard {
-				if cerr := copyToClipboard(v.Value); cerr != nil {
+			if len(vars) == 0 {
+				fmt.Printf("%s No variables match %s\n", ui.IconWarning, ui.Warning(pattern.Describe(pat, useRegex)))
+				return nil
+			}
+
+			if clipboard && len(vars) == 1 {
+				if cerr := copyToClipboard(vars[0].Value); cerr != nil {
 					fmt.Printf("%s %s\n", ui.IconWarning, ui.Warning(fmt.Sprintf("Clipboard error: %v", cerr)))
 				} else {
 					fmt.Printf("%s %s\n", ui.IconInfo, ui.Info("Value copied to clipboard"))
 				}
 			}
+
 			if format != "text" {
-				output, _ := env.FormatVariable(v, format)
+				output, _ := env.FormatVariables(vars, format)
 				fmt.Print(output)
 				return nil
 			}
-			fmt.Printf("\n%s %s (%s)\n  %s\n",
-				ui.GetScopeIcon(scope), ui.Highlight(v.Name),
-				ui.Dim(scopeType.String()), ui.Path(v.Value))
+			for _, v := range vars {
+				fmt.Printf("\n%s %s (%s)\n  %s\n",
+					ui.GetScopeIcon(v.Scope.String()), ui.Highlight(v.Name),
+					ui.Dim(v.Scope.String()), ui.Path(v.Value))
+			}
+			if len(vars) > 1 {
+				fmt.Printf("\n%s %s\n", ui.IconCheck, ui.Dim(fmt.Sprintf("%d variables matched", len(vars))))
+			}
 			return nil
 		},
 	}
-	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
-	cmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy value to clipboard")
+	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user, system, or both")
+	cmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy value to clipboard (single match only)")
+	cmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat pattern as regex instead of glob")
 	return cmd
 }
 
@@ -165,9 +252,9 @@ func setCmd() *cobra.Command {
 		Aliases: []string{"s"},
 		Short:   fmt.Sprintf("%s Set environment variable (replaces entire value)", ui.IconSave),
 		Long: `Create or REPLACE an environment variable with the specified value.
-Cobra parses flags correctly before RunE — no manual string stripping needed.
+Pattern matching is intentionally NOT supported for set — mass-overwrite is too dangerous.
   -s/--scope     user (default) or system
-  -r/--refresh   update current terminal session immediately
+  -r/--refresh   broadcast WM_SETTINGCHANGE to GUI apps
   -c/--clipboard copy new value to clipboard`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -208,14 +295,14 @@ Cobra parses flags correctly before RunE — no manual string stripping needed.
 				ui.Highlight(varName), ui.Path(value),
 				ui.GetScopeIcon(scope), ui.Dim(scopeType.String()))
 			if refresh {
-				fmt.Printf(" %s", ui.Info("[terminal updated]"))
+				fmt.Printf(" %s", ui.Info("[WM_SETTINGCHANGE broadcast]"))
 			}
 			fmt.Println()
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
-	cmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Update current terminal session immediately")
+	cmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Broadcast WM_SETTINGCHANGE to GUI apps after registry write")
 	cmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy new value to clipboard")
 	return cmd
 }
@@ -227,6 +314,8 @@ func appendCmd() *cobra.Command {
 	var position string
 	var refresh bool
 	var clipboard bool
+	var temp bool
+	var shell string
 
 	cmd := &cobra.Command{
 		Use:     "append [variable] [value]",
@@ -234,8 +323,11 @@ func appendCmd() *cobra.Command {
 		Short:   fmt.Sprintf("%s Append value to variable", ui.IconPlus),
 		Long: `Append value to existing variable at beginning (pre) or end (post).
 Duplicates are detected and prevented.
-Flags work before OR after the value:
-  pathman append PATH "C:\MyTool" -s system -r -c`,
+Pattern matching is NOT applied here — the variable name must be exact.
+
+  --temp          Print shell command to update CURRENT terminal only (no registry write).
+                  Pipe output through eval (cmd) or Invoke-Expression (PowerShell).
+  --shell         Shell format for --temp: cmd (default) or powershell`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
@@ -248,6 +340,35 @@ Flags work before OR after the value:
 				fmt.Printf("%s %s '%s' to %s (position: %s, scope: %s)\n",
 					ui.IconInfo, ui.Info("Would append"), ui.Path(value),
 					ui.Highlight(varName), ui.Dim(appendPos.String()), ui.Dim(scopeType.String()))
+				return nil
+			}
+
+			if temp {
+				currentVar, err := m.Get(varName, scopeType)
+				if err != nil {
+					fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error reading %s: %v", varName, err)))
+					return err
+				}
+				current := env.NormalizePathSeparator(currentVar.Value)
+				for _, p := range strings.Split(current, string(os.PathListSeparator)) {
+					if strings.EqualFold(strings.TrimSpace(p), strings.TrimSpace(value)) {
+						fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: value already exists in %s", varName)))
+						return fmt.Errorf("value already exists in %s", varName)
+					}
+				}
+				var newVal string
+				if appendPos == env.AppendPre {
+					newVal = value + string(os.PathListSeparator) + current
+				} else {
+					newVal = current + string(os.PathListSeparator) + value
+				}
+				newVal = env.NormalizePathSeparator(newVal)
+				switch strings.ToLower(shell) {
+				case "powershell", "ps", "pwsh":
+					fmt.Printf("$env:%s = '%s'\n", varName, newVal)
+				default:
+					fmt.Printf("set %s=%s\n", varName, newVal)
+				}
 				return nil
 			}
 
@@ -278,7 +399,7 @@ Flags work before OR after the value:
 				ui.Path(value), ui.Highlight(varName),
 				ui.Dim(appendPos.String()), ui.Dim(scopeType.String()))
 			if refresh {
-				fmt.Printf(" %s", ui.Info("[terminal updated]"))
+				fmt.Printf(" %s", ui.Info("[WM_SETTINGCHANGE broadcast]"))
 			}
 			fmt.Println()
 			return nil
@@ -286,8 +407,10 @@ Flags work before OR after the value:
 	}
 	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
 	cmd.Flags().StringVarP(&position, "position", "p", "post", "Append position: pre or post")
-	cmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Update current terminal session immediately")
+	cmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Broadcast WM_SETTINGCHANGE to GUI apps after registry write")
 	cmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy updated variable value to clipboard")
+	cmd.Flags().BoolVar(&temp, "temp", false, "Print shell command to update current terminal only (no registry write)")
+	cmd.Flags().StringVar(&shell, "shell", "cmd", "Shell format for --temp output: cmd or powershell")
 	return cmd
 }
 
@@ -295,38 +418,76 @@ Flags work before OR after the value:
 
 func deleteCmd() *cobra.Command {
 	var scope string
+	var useRegex bool
+	var confirm bool
 
 	cmd := &cobra.Command{
-		Use:     "delete [variable]",
+		Use:     "delete [variable|pattern]",
 		Aliases: []string{"d", "rm", "unset"},
 		Short:   fmt.Sprintf("%s Delete environment variable", ui.IconDelete),
-		Long:    "Remove an entire environment variable from the specified scope",
-		Args:    cobra.ExactArgs(1),
+		Long: `Remove environment variables matching the given name or pattern.
+Glob (* ? [abc]) and --regex patterns are supported.
+When a pattern matches multiple variables, --confirm is required.
+
+Examples:
+  pathman delete MYVAR
+  pathman delete "TEMP_*" --confirm
+  pathman delete "^JAVA" --regex --confirm -s system`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
+			pat := args[0]
 			scopeType := scopeFromString(scope)
 
-			if dryRun {
-				fmt.Printf("%s %s '%s' (%s %s)\n",
-					ui.IconInfo, ui.Info("Would delete"),
-					ui.Highlight(args[0]),
-					ui.GetScopeIcon(scope), ui.Dim(scopeType.String()))
+			vars, err := matchVars(m, pat, scopeType, useRegex)
+			if err != nil {
+				fmt.Printf("%s %s\n", ui.IconError, ui.Error(err.Error()))
+				return err
+			}
+			if len(vars) == 0 {
+				fmt.Printf("%s No variables match %s\n", ui.IconWarning, ui.Warning(pattern.Describe(pat, useRegex)))
 				return nil
 			}
 
-			if err := m.Delete(args[0], scopeType); err != nil {
-				fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
-				return err
+			// Safety: require --confirm when pattern hits multiple vars
+			if len(vars) > 1 && !confirm {
+				fmt.Printf("%s Pattern matches %d variables. Use --confirm to delete all:\n",
+					ui.IconWarning, len(vars))
+				for _, v := range vars {
+					fmt.Printf("    %s %s (%s)\n", ui.IconMinus, ui.Highlight(v.Name), ui.Dim(v.Scope.String()))
+				}
+				return fmt.Errorf("use --confirm to delete %d variables", len(vars))
 			}
 
-			fmt.Printf("%s %s '%s' (%s %s)\n",
-				ui.IconSuccess, ui.Success("Successfully deleted"),
-				ui.Highlight(args[0]),
-				ui.GetScopeIcon(scope), ui.Dim(scopeType.String()))
+			if dryRun {
+				for _, v := range vars {
+					fmt.Printf("%s %s '%s' (%s)\n",
+						ui.IconInfo, ui.Info("Would delete"),
+						ui.Highlight(v.Name), ui.Dim(scopeType.String()))
+				}
+				return nil
+			}
+
+			deleted := 0
+			for _, v := range vars {
+				if err := m.Delete(v.Name, scopeType); err != nil {
+					fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error deleting %s: %v", v.Name, err)))
+					continue
+				}
+				fmt.Printf("%s %s '%s' (%s)\n",
+					ui.IconSuccess, ui.Success("Deleted"),
+					ui.Highlight(v.Name), ui.Dim(scopeType.String()))
+				deleted++
+			}
+			if len(vars) > 1 {
+				fmt.Printf("\n%s %s\n", ui.IconCheck, ui.Dim(fmt.Sprintf("Deleted %d/%d variables", deleted, len(vars))))
+			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
+	cmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat pattern as regex instead of glob")
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm deletion when pattern matches multiple variables")
 	return cmd
 }
 
@@ -335,63 +496,150 @@ func deleteCmd() *cobra.Command {
 func listCmd() *cobra.Command {
 	var scope string
 	var clipboard bool
+	var filter string
+	var filterValue string
+	var useRegex bool
 
 	cmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"l", "ls", "all"},
 		Short:   fmt.Sprintf("%s List all environment variables", ui.IconList),
-		Long:    "Display all environment variables (default: both user and system). Use -c to copy to clipboard.",
+		Long: `Display environment variables. Supports filtering by name and/or value.
+
+  --filter/-F   glob/regex pattern matched against variable NAMES
+  --value/-V    glob/regex pattern matched against variable VALUES
+  --regex/-R    treat patterns as regex instead of glob
+  -c            copy output to clipboard
+
+Examples:
+  pathman list --filter "*PATH*"
+  pathman list --filter "JAVA*" -s system
+  pathman list --value "C:\\Python*"
+  pathman list --filter "*" --value "*mingw*" --regex`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
 			scopeStr := strings.ToLower(scope)
 
-			if format != "text" {
-				var allVars []env.Variable
-				if scopeStr == "user" {
-					vars, _ := m.List(env.ScopeUser)
-					allVars = vars
-				} else if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
-					vars, _ := m.List(env.ScopeSystem)
-					allVars = vars
-				} else {
-					userVars, _ := m.List(env.ScopeUser)
-					sysVars, _ := m.List(env.ScopeSystem)
-					allVars = append(userVars, sysVars...)
+			// Collect vars for requested scope(s)
+			var allVars []env.Variable
+			if scopeStr == "user" {
+				vars, _ := m.List(env.ScopeUser)
+				allVars = vars
+			} else if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
+				vars, _ := m.List(env.ScopeSystem)
+				allVars = vars
+			} else {
+				userVars, _ := m.List(env.ScopeUser)
+				sysVars, _ := m.List(env.ScopeSystem)
+				allVars = append(userVars, sysVars...)
+			}
+
+			// Apply name filter
+			if filter != "" {
+				var filtered []env.Variable
+				for _, v := range allVars {
+					ok, err := pattern.Match(filter, v.Name, useRegex)
+					if err != nil {
+						fmt.Printf("%s Invalid filter pattern: %v\n", ui.IconError, err)
+						return err
+					}
+					if ok {
+						filtered = append(filtered, v)
+					}
 				}
+				allVars = filtered
+			}
+
+			// Apply value filter
+			if filterValue != "" {
+				var filtered []env.Variable
+				for _, v := range allVars {
+					ok, err := pattern.Match(filterValue, v.Value, useRegex)
+					if err != nil {
+						fmt.Printf("%s Invalid value pattern: %v\n", ui.IconError, err)
+						return err
+					}
+					if ok {
+						filtered = append(filtered, v)
+					}
+				}
+				allVars = filtered
+			}
+
+			if len(allVars) == 0 {
+				fmt.Printf("%s No variables match the given filters\n", ui.IconWarning)
+				return nil
+			}
+
+			if format != "text" {
 				output, err := env.FormatVariables(allVars, format)
 				if err != nil {
 					return err
 				}
 				if clipboard {
-					if cerr := copyToClipboard(output); cerr != nil {
-						fmt.Printf("%s %s\n", ui.IconWarning, ui.Warning(fmt.Sprintf("Clipboard error: %v", cerr)))
-					} else {
-						fmt.Printf("%s %s\n", ui.IconInfo, ui.Info("Output copied to clipboard"))
-					}
+					copyToClipboard(output)
 				}
 				fmt.Print(output)
 				return nil
 			}
 
 			var buf strings.Builder
-			if scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
-				if err := appendVarSection(m, env.ScopeSystem, &buf); err != nil {
-					return err
+			if filter != "" || filterValue != "" {
+				// Filtered: show flat list regardless of scope grouping
+				label := ""
+				if filter != "" {
+					label += "name:" + filter
 				}
-			} else if scopeStr == "user" {
-				if err := appendVarSection(m, env.ScopeUser, &buf); err != nil {
-					return err
+				if filterValue != "" {
+					if label != "" {
+						label += " "
+					}
+					label += "value:" + filterValue
 				}
+				buf.WriteString(fmt.Sprintf("\n%s Filtered variables  %s\n",
+					ui.IconSearch, ui.Dim("("+label+")")))
+				buf.WriteString(strings.Repeat("─", 80) + "\n")
+				maxLen := 22
+				for _, v := range allVars {
+					if len(v.Name) > maxLen {
+						maxLen = len(v.Name)
+					}
+				}
+				maxLen += 3
+				for _, v := range allVars {
+					value := v.Value
+					if len(value) > 55 {
+						value = value[:52] + "..."
+					}
+					padding := strings.Repeat(" ", maxLen-len(v.Name))
+					scopeTag := ui.Dim("[" + v.Scope.String() + "]")
+					buf.WriteString(fmt.Sprintf("  %s%s %s %s  %s\n",
+						ui.KeyValue(v.Name), padding, ui.Dim("="), ui.Path(value), scopeTag))
+				}
+				buf.WriteString(fmt.Sprintf("\n%s %s\n", ui.IconCheck,
+					ui.Dim(fmt.Sprintf("%d variable(s) matched", len(allVars)))))
+			} else if scopeStr == "user" || scopeStr == "system" || scopeStr == "machine" || scopeStr == "global" {
+				sType := env.ScopeUser
+				if scopeStr != "user" {
+					sType = env.ScopeSystem
+				}
+				appendVarSection(m, sType, &buf)
 			} else {
 				buf.WriteString(fmt.Sprintf("\n%s Environment Variables - Both Scopes\n", ui.HeaderInfo("🌍")))
 				buf.WriteString(strings.Repeat("═", 80) + "\n")
-				userVars, _ := m.List(env.ScopeUser)
-				sysVars, _ := m.List(env.ScopeSystem)
+				var userVars, sysVars []env.Variable
+				for _, v := range allVars {
+					if v.Scope == env.ScopeUser {
+						userVars = append(userVars, v)
+					} else {
+						sysVars = append(sysVars, v)
+					}
+				}
 				writeVarSection(ui.IconUser, "User", userVars, &buf)
 				buf.WriteString("\n")
 				writeVarSection(ui.IconSystem, "System", sysVars, &buf)
 				buf.WriteString(fmt.Sprintf("\n%s %s\n", ui.IconCheck,
-					ui.Dim(fmt.Sprintf("Total: %d variables (User + System)", len(userVars)+len(sysVars)))))
+					ui.Dim(fmt.Sprintf("Total: %d variables (User + System)", len(allVars)))))
 			}
 
 			out := buf.String()
@@ -408,6 +656,9 @@ func listCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&scope, "scope", "s", "both", "Scope: user, system, or both")
 	cmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy output to clipboard")
+	cmd.Flags().StringVarP(&filter, "filter", "F", "", "Glob/regex pattern to filter by variable name")
+	cmd.Flags().StringVarP(&filterValue, "value", "V", "", "Glob/regex pattern to filter by variable value")
+	cmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat filter patterns as regex instead of glob")
 	return cmd
 }
 
@@ -481,9 +732,10 @@ func pathCmd() *cobra.Command {
 			Aliases: []string{"a", "append"},
 			Short:   fmt.Sprintf("%s Add directory to PATH", ui.IconPlus),
 			Long: `Add a new directory to the PATH variable.
+Pattern matching is NOT applied here — the directory path must be literal.
   -s/--scope     user (default) or system
   -p/--position  pre (front) or post (end, default)
-  -r/--refresh   update current terminal immediately
+  -r/--refresh   broadcast WM_SETTINGCHANGE to GUI apps
   -c/--clipboard copy updated PATH to clipboard`,
 			Args: cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
@@ -497,8 +749,6 @@ func pathCmd() *cobra.Command {
 					return err
 				}
 
-				// Warn about non-existent paths but still allow adding.
-				// checkExist=false so PathAdd doesn't double-error after our warning.
 				if _, err := os.Stat(absPath); os.IsNotExist(err) {
 					fmt.Printf("%s %s\n", ui.IconWarning,
 						ui.Warning(fmt.Sprintf("Warning: Path does not exist: %s", absPath)))
@@ -518,11 +768,8 @@ func pathCmd() *cobra.Command {
 
 				if clipboard {
 					if v, err := m.Get("PATH", scopeType); err == nil {
-						if cerr := copyToClipboard(v.Value); cerr != nil {
-							fmt.Printf("%s %s\n", ui.IconWarning, ui.Warning(fmt.Sprintf("Clipboard error: %v", cerr)))
-						} else {
-							fmt.Printf("%s %s\n", ui.IconInfo, ui.Info("Updated PATH copied to clipboard"))
-						}
+						copyToClipboard(v.Value)
+						fmt.Printf("%s %s\n", ui.IconInfo, ui.Info("Updated PATH copied to clipboard"))
 					}
 				}
 
@@ -538,7 +785,7 @@ func pathCmd() *cobra.Command {
 					ui.Dim(appendPos.String()),
 				)
 				if refresh {
-					fmt.Printf(" %s", ui.Info("[terminal updated]"))
+					fmt.Printf(" %s", ui.Info("[WM_SETTINGCHANGE broadcast]"))
 				}
 				fmt.Println()
 				return nil
@@ -546,7 +793,7 @@ func pathCmd() *cobra.Command {
 		}
 		addCmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
 		addCmd.Flags().StringVarP(&position, "position", "p", "post", "Add position: pre or post")
-		addCmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Update current terminal session immediately")
+		addCmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Broadcast WM_SETTINGCHANGE to GUI apps after registry write")
 		addCmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy updated PATH to clipboard")
 		cmd.AddCommand(addCmd)
 	}
@@ -554,27 +801,88 @@ func pathCmd() *cobra.Command {
 	// ── path remove ───────────────────────────────────────────────────────
 	{
 		var scope string
+		var useRegex bool
+		var confirm bool
 
 		removeCmd := &cobra.Command{
-			Use:     "remove [directory]",
+			Use:     "remove [directory|pattern]",
 			Aliases: []string{"rm", "delete"},
 			Short:   fmt.Sprintf("%s Remove directory from PATH", ui.IconMinus),
-			Long:    "Remove a directory from the PATH variable",
-			Args:    cobra.ExactArgs(1),
+			Long: `Remove entries from the PATH variable.
+Accepts glob patterns (* ? [abc]) or --regex for regex.
+When a pattern matches multiple entries, --confirm is required.
+
+Examples:
+  pathman path remove "C:\Python38"
+  pathman path remove "C:\Python3*" --confirm
+  pathman path remove "C:\\Python3[78]" --regex --confirm -s system`,
+			Args: cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				m := env.NewManager(dryRun)
 				scopeType := scopeFromString(scope)
-				if err := m.PathRemove("PATH", args[0], scopeType); err != nil {
+				pat := args[0]
+
+				entries, err := m.PathList("PATH", scopeType)
+				if err != nil {
 					fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
 					return err
 				}
-				fmt.Printf("%s %s %s (%s)\n",
-					ui.IconSuccess, ui.Success("Removed from PATH:"),
-					ui.Path(args[0]), ui.Dim(scopeType.String()))
+
+				// Find matching entries
+				var toRemove []env.PathEntry
+				for _, e := range entries {
+					ok, err := pattern.Match(pat, e.Value, useRegex)
+					if err != nil {
+						fmt.Printf("%s Invalid pattern: %v\n", ui.IconError, err)
+						return err
+					}
+					if ok {
+						toRemove = append(toRemove, e)
+					}
+				}
+
+				if len(toRemove) == 0 {
+					fmt.Printf("%s No PATH entries match %s\n", ui.IconWarning, ui.Warning(pattern.Describe(pat, useRegex)))
+					return nil
+				}
+
+				if len(toRemove) > 1 && !confirm {
+					fmt.Printf("%s Pattern matches %d PATH entries. Use --confirm to remove all:\n",
+						ui.IconWarning, len(toRemove))
+					for _, e := range toRemove {
+						fmt.Printf("    %s %s\n", ui.IconMinus, ui.Path(e.Value))
+					}
+					return fmt.Errorf("use --confirm to remove %d entries", len(toRemove))
+				}
+
+				if dryRun {
+					for _, e := range toRemove {
+						fmt.Printf("%s %s %s\n", ui.IconInfo, ui.Info("Would remove:"), ui.Path(e.Value))
+					}
+					return nil
+				}
+
+				removed := 0
+				for _, e := range toRemove {
+					if err := m.PathRemove("PATH", e.Value, scopeType); err != nil {
+						fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error removing %s: %v", e.Value, err)))
+						continue
+					}
+					fmt.Printf("%s %s %s (%s)\n",
+						ui.IconSuccess, ui.Success("Removed from PATH:"),
+						ui.Path(e.Value), ui.Dim(scopeType.String()))
+					removed++
+				}
+				if len(toRemove) > 1 {
+					fmt.Printf("\n%s %s\n", ui.IconCheck,
+						ui.Dim(fmt.Sprintf("Removed %d/%d entries", removed, len(toRemove))))
+				}
 				return nil
 			},
 		}
 		removeCmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
+		removeCmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat pattern as regex instead of glob")
+		removeCmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm removal when pattern matches multiple entries")
 		cmd.AddCommand(removeCmd)
 	}
 
@@ -582,12 +890,22 @@ func pathCmd() *cobra.Command {
 	{
 		var scope string
 		var clipboard bool
+		var filter string
+		var useRegex bool
 
 		listPathCmd := &cobra.Command{
 			Use:     "list",
 			Aliases: []string{"ls", "show"},
 			Short:   fmt.Sprintf("%s List PATH entries", ui.IconList),
-			Long:    "Display all entries in the PATH variable. Use -c to copy plain-text list to clipboard.",
+			Long: `Display all entries in the PATH variable.
+  --filter/-F   glob/regex pattern to filter entries by path string
+  --regex/-R    treat filter as regex instead of glob
+  -c            copy plain-text list to clipboard
+
+Examples:
+  pathman path list
+  pathman path list --filter "C:\Python*"
+  pathman path list --filter "mingw" --regex -s system`,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				m := env.NewManager(dryRun)
 				scopeType := scopeFromString(scope)
@@ -597,13 +915,40 @@ func pathCmd() *cobra.Command {
 					return err
 				}
 
+				// Apply filter
+				if filter != "" {
+					var filtered []env.PathEntry
+					for _, e := range entries {
+						ok, err := pattern.Match(filter, e.Value, useRegex)
+						if err != nil {
+							fmt.Printf("%s Invalid filter: %v\n", ui.IconError, err)
+							return err
+						}
+						if ok {
+							filtered = append(filtered, e)
+						}
+					}
+					entries = filtered
+				}
+
+				if len(entries) == 0 {
+					fmt.Printf("%s No PATH entries match filter\n", ui.IconWarning)
+					return nil
+				}
+
 				var colored strings.Builder
 				var plain strings.Builder
-				colored.WriteString(fmt.Sprintf("\n%s %s PATH Entries:\n",
+				header := fmt.Sprintf("%s PATH Entries", scopeType.String())
+				if filter != "" {
+					header += "  (" + pattern.Describe(filter, useRegex) + ")"
+				}
+				colored.WriteString(fmt.Sprintf("\n%s %s PATH Entries",
 					ui.GetScopeIcon(scope), ui.HeaderInfo(scopeType.String())))
-				colored.WriteString(strings.Repeat("─", 80) + "\n")
-				plain.WriteString(fmt.Sprintf("%s PATH Entries:\n%s\n",
-					scopeType.String(), strings.Repeat("-", 60)))
+				if filter != "" {
+					colored.WriteString("  " + ui.Dim("("+pattern.Describe(filter, useRegex)+")"))
+				}
+				colored.WriteString("\n" + strings.Repeat("─", 80) + "\n")
+				plain.WriteString(header + "\n" + strings.Repeat("-", 60) + "\n")
 
 				for _, entry := range entries {
 					status := ui.IconCheck
@@ -614,6 +959,11 @@ func pathCmd() *cobra.Command {
 					}
 					colored.WriteString(fmt.Sprintf("  %s [%3d] %s\n", status, entry.Index, ui.Path(entry.Value)))
 					plain.WriteString(fmt.Sprintf("[%s] %3d  %s\n", plainStatus, entry.Index, entry.Value))
+				}
+				if filter != "" {
+					colored.WriteString(fmt.Sprintf("\n%s %s\n", ui.IconCheck,
+						ui.Dim(fmt.Sprintf("%d entries matched", len(entries)))))
+					plain.WriteString(fmt.Sprintf("\n%d entries matched\n", len(entries)))
 				}
 
 				if clipboard {
@@ -629,6 +979,8 @@ func pathCmd() *cobra.Command {
 		}
 		listPathCmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
 		listPathCmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy PATH entries (plain text) to clipboard")
+		listPathCmd.Flags().StringVarP(&filter, "filter", "F", "", "Glob/regex pattern to filter entries")
+		listPathCmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat filter as regex instead of glob")
 		cmd.AddCommand(listPathCmd)
 	}
 
@@ -640,22 +992,37 @@ func pathCmd() *cobra.Command {
 func parseCmd() *cobra.Command {
 	var scope string
 	var clipboard bool
+	var useRegex bool
 
 	cmd := &cobra.Command{
-		Use:     "parse [variable]",
+		Use:     "parse [variable|pattern]",
 		Aliases: []string{"format", "export", "fmt"},
 		Short:   fmt.Sprintf("%s Parse variable to different format", ui.IconRefresh),
-		Long:    "Output variable in specified format (json, yaml, csv, table). Use -c to copy to clipboard.",
-		Args:    cobra.ExactArgs(1),
+		Long: `Output variable(s) in specified format (json, yaml, csv, table).
+Accepts glob patterns or --regex for multiple variable output.
+Use -c to copy to clipboard.
+
+Examples:
+  pathman parse PATH -f json
+  pathman parse "JAVA*" -f table
+  pathman parse "*" -f csv -s system`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
+			pat := args[0]
 			scopeType := scopeFromString(scope)
-			v, err := m.Get(args[0], scopeType)
+
+			vars, err := matchVars(m, pat, scopeType, useRegex)
 			if err != nil {
 				fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
 				return err
 			}
-			output, err := env.FormatVariable(v, format)
+			if len(vars) == 0 {
+				fmt.Printf("%s No variables match %s\n", ui.IconWarning, ui.Warning(pattern.Describe(pat, useRegex)))
+				return nil
+			}
+
+			output, err := env.FormatVariables(vars, format)
 			if err != nil {
 				return err
 			}
@@ -672,6 +1039,7 @@ func parseCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
 	cmd.Flags().BoolVarP(&clipboard, "clipboard", "c", false, "Copy formatted output to clipboard")
+	cmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat pattern as regex instead of glob")
 	return cmd
 }
 
@@ -770,55 +1138,112 @@ func infoCmd() *cobra.Command {
 func removeValueCmd() *cobra.Command {
 	var scope string
 	var refresh bool
+	var useRegex bool
+	var confirm bool
 
 	cmd := &cobra.Command{
-		Use:     "remove-value [variable] [value]",
+		Use:     "remove-value [variable] [value|pattern]",
 		Aliases: []string{"rv", "remove", "unappend"},
 		Short:   fmt.Sprintf("%s Remove value from variable", ui.IconMinus),
-		Long:    "Remove a specific value from a semicolon-separated variable",
-		Args:    cobra.ExactArgs(2),
+		Long: `Remove one or more values from a semicolon-separated variable.
+The value argument accepts glob patterns or --regex.
+When a pattern matches multiple entries, --confirm is required.
+
+Examples:
+  pathman remove-value PATH "C:\Python38"
+  pathman remove-value PATH "C:\Python3*" --confirm
+  pathman remove-value PYTHONPATH "*site-packages*" --confirm
+  pathman remove-value PATH "Python3[78]" --regex --confirm`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
 			scopeType := scopeFromString(scope)
+			varName := args[0]
+			pat := args[1]
 
-			if dryRun {
-				fmt.Printf("%s Would remove '%s' from %s (%s)\n",
-					ui.IconInfo, ui.Path(args[1]), ui.Highlight(args[0]), ui.Dim(scopeType.String()))
-				return nil
-			}
-
-			if err := m.PathRemove(args[0], args[1], scopeType); err != nil {
+			v, err := m.Get(varName, scopeType)
+			if err != nil {
 				fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
 				return err
 			}
 
-			fmt.Printf("%s Removed '%s' from %s (%s)\n",
-				ui.IconSuccess, ui.Path(args[1]), ui.Highlight(args[0]), ui.Dim(scopeType.String()))
+			parts := strings.Split(env.NormalizePathSeparator(v.Value), string(os.PathListSeparator))
+			var toRemove []string
+			var toKeep []string
+			for _, p := range parts {
+				if p == "" {
+					continue
+				}
+				ok, err := pattern.Match(pat, p, useRegex)
+				if err != nil {
+					fmt.Printf("%s Invalid pattern: %v\n", ui.IconError, err)
+					return err
+				}
+				if ok {
+					toRemove = append(toRemove, p)
+				} else {
+					toKeep = append(toKeep, p)
+				}
+			}
+
+			if len(toRemove) == 0 {
+				fmt.Printf("%s No values match %s in %s\n",
+					ui.IconWarning, ui.Warning(pattern.Describe(pat, useRegex)), ui.Highlight(varName))
+				return nil
+			}
+
+			if len(toRemove) > 1 && !confirm {
+				fmt.Printf("%s Pattern matches %d values in %s. Use --confirm to remove all:\n",
+					ui.IconWarning, len(toRemove), ui.Highlight(varName))
+				for _, p := range toRemove {
+					fmt.Printf("    %s %s\n", ui.IconMinus, ui.Path(p))
+				}
+				return fmt.Errorf("use --confirm to remove %d values", len(toRemove))
+			}
+
+			if dryRun {
+				for _, p := range toRemove {
+					fmt.Printf("%s %s '%s' from %s\n",
+						ui.IconInfo, ui.Info("Would remove"), ui.Path(p), ui.Highlight(varName))
+				}
+				return nil
+			}
+
+			newValue := env.NormalizePathSeparator(strings.Join(toKeep, string(os.PathListSeparator)))
+			if err := m.Set(varName, newValue, scopeType); err != nil {
+				fmt.Printf("%s %s\n", ui.IconError, ui.Error(fmt.Sprintf("Error: %v", err)))
+				return err
+			}
+
+			for _, p := range toRemove {
+				fmt.Printf("%s Removed '%s' from %s (%s)\n",
+					ui.IconSuccess, ui.Path(p), ui.Highlight(varName), ui.Dim(scopeType.String()))
+			}
+			if len(toRemove) > 1 {
+				fmt.Printf("\n%s %s\n", ui.IconCheck,
+					ui.Dim(fmt.Sprintf("Removed %d values from %s", len(toRemove), varName)))
+			}
 
 			if refresh {
-				// SetAndRefresh broadcasts WM_SETTINGCHANGE — bare os.Setenv does not.
-				if v, err := m.Get(args[0], scopeType); err == nil {
-					if rerr := m.SetAndRefresh(args[0], v.Value, scopeType); rerr != nil {
-						fmt.Printf("%s %s\n", ui.IconWarning,
-							ui.Warning(fmt.Sprintf("Refresh warning: %v", rerr)))
-					} else {
-						fmt.Printf("%s %s\n", ui.IconInfo, ui.Info("[terminal updated]"))
-					}
+				if rerr := m.SetAndRefresh(varName, newValue, scopeType); rerr != nil {
+					fmt.Printf("%s %s\n", ui.IconWarning,
+						ui.Warning(fmt.Sprintf("Refresh warning: %v", rerr)))
+				} else {
+					fmt.Printf("%s %s\n", ui.IconInfo, ui.Info("[WM_SETTINGCHANGE broadcast]"))
 				}
 			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
-	cmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Update current terminal session immediately")
+	cmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Broadcast WM_SETTINGCHANGE to GUI apps after registry write")
+	cmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat value pattern as regex instead of glob")
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm when pattern matches multiple values")
 	return cmd
 }
 
 // ─── refresh ────────────────────────────────────────────────────────────────
 
-// refreshCmd rebuilds the current process PATH from the Windows registry,
-// combining System PATH + User PATH exactly as a new terminal session would,
-// then broadcasts WM_SETTINGCHANGE so Explorer and other apps pick up the change.
 func refreshCmd() *cobra.Command {
 	var clipboard bool
 
@@ -826,10 +1251,14 @@ func refreshCmd() *cobra.Command {
 		Use:     "refresh",
 		Aliases: []string{"reload", "sync", "update-path"},
 		Short:   fmt.Sprintf("%s Refresh PATH in current terminal from registry", ui.IconRefresh),
-		Long: `Rebuild the current terminal's PATH by reading System + User PATH from the
-Windows registry and broadcasting WM_SETTINGCHANGE to all windows.
-Run this after any tool has modified environment variables outside of pathman.
-  -c/--clipboard  copy the refreshed PATH to clipboard`,
+		Long: `Read System + User PATH from the Windows registry and broadcast
+WM_SETTINGCHANGE to notify GUI apps (Explorer, some IDEs) to reload env.
+
+NOTE: This cannot update the PATH of your current cmd/PowerShell session.
+Windows does not allow a child process to write into its parent's environment.
+To update the current terminal, use --temp on append/path add:
+  for /f "delims=" %i in ('pathman append PATH "C:\Tool" --temp') do @%i
+  Invoke-Expression (pathman append PATH "C:\Tool" --temp --shell powershell)`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m := env.NewManager(dryRun)
 

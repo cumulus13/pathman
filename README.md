@@ -11,6 +11,7 @@ Professional, production-ready CLI tool for managing Windows environment variabl
 - 🧹 **Path Cleanup** - Remove duplicates and invalid paths
 - ⚡ **Fast & Lightweight** - Native Windows performance
 - 📋 **PATH Management** - Easy add/remove/list operations
+- 🔍 **Find** - Search names, values and PATH entries across all variables or just one
 
 ## 🚀 Installation
 
@@ -95,6 +96,50 @@ pathman get PATH -f json > path.json
 pathman list -f json | jq .
 ```
 
+### Edit entries inside a variable
+
+Works on any `;`-separated variable (PATH, PATHEXT, PYTHONPATH, ...), keeps entry order.
+
+```
+pathman edit PATH Python38 Python312               # substring replace
+pathman edit PATH "C:\\Python3*" "C:\\Py312" --confirm # glob: whole entry replaced
+pathman edit PATH "^C:\\Old(.*)" "D:\\New$1" -R        # regex with groups
+pathman edit PATH --at 4 "C:\\Tools\\bin" -s system     # replace entry #4 (numbers from `find`)
+pathman edit PYTHONPATH "C:\\lib" "D:\\lib" --dry-run   # preview
+
+pathman remove-value PATH "C:\\Old*" --confirm    # delete entries (any variable)
+pathman append PATH "C:\\New" -p pre              # add entry (front/end)
+```
+
+### Find
+
+```
+# Search EVERYTHING (names, values, PATH-style entries) in user + system scope
+pathman find python
+
+# Search inside ONE variable only
+pathman find python -e PATH
+pathman find "C:\\Program Files*" -e PATH -s system
+
+# Restrict what is searched: name | value | entry
+pathman find java --in name
+pathman find "C:\\Go*" --in value
+
+# Glob / regex
+pathman find "C:\\Python3*"
+pathman find "^C:\\Go" -R -e PATH
+
+# Flag PATH entries whose directory no longer exists
+pathman find . -e PATH --exists
+
+# Only names of matching variables / machine-readable output
+pathman find mingw -l
+pathman find python -f json
+```
+
+Query: plain text = case-insensitive substring; `* ? [abc]` = glob (whole text); `-R` = regex.
+Flags: `-e/--env NAME`, `--in all|name|value|entry`, `-s/--scope user|system|both` (default `both`), `-R/--regex`, `--exists`, `-l/--list`.
+
 ### Flags
 
 - `-s, --scope` - Set scope (user|system) [default: user]
@@ -114,6 +159,8 @@ Most commands have short aliases:
 - `path add` → `a`, `append`
 - `path list` → `ls`, `show`
 - `clean` → `cleanup`, `dedupe`
+- `edit` → `replace`, `change`, `sub`
+- `find` → `search`, `grep`, `fd`, `locate`
 
 ## 🔒 Permissions
 

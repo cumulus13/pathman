@@ -69,6 +69,7 @@ Features:
   • Append to variables with pre/post position
   • User and System scope management
   • Wildcard/glob and regex pattern matching
+  • Find text in names, values and PATH entries (all vars or just one)
   • Duplicate detection and cleanup
   • Non-existent path validation
   • JSON, YAML, CSV, Table output formats
@@ -103,7 +104,7 @@ Examples:
 	rootCmd.AddCommand(
 		getCmd(), setCmd(), appendCmd(), deleteCmd(),
 		pathCmd(), cleanCmd(), parseCmd(), removeValueCmd(),
-		infoCmd(), listCmd(), refreshCmd(),
+		infoCmd(), listCmd(), refreshCmd(), findCmd(), editCmd(),
 	)
 }
 

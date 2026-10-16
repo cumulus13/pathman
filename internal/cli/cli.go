@@ -491,6 +491,9 @@ Examples:
 			if len(vars) > 1 {
 				fmt.Printf("\n%s %s\n", ui.IconCheck, ui.Dim(fmt.Sprintf("Deleted %d/%d variables", deleted, len(vars))))
 			}
+			if deleted < len(vars) {
+				return fmt.Errorf("%d of %d deletions failed", len(vars)-deleted, len(vars))
+			}
 			return nil
 		},
 	}
@@ -885,6 +888,9 @@ Examples:
 				if len(toRemove) > 1 {
 					fmt.Printf("\n%s %s\n", ui.IconCheck,
 						ui.Dim(fmt.Sprintf("Removed %d/%d entries", removed, len(toRemove))))
+				}
+				if removed < len(toRemove) {
+					return fmt.Errorf("%d of %d removals failed", len(toRemove)-removed, len(toRemove))
 				}
 				return nil
 			},

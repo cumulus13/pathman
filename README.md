@@ -1,5 +1,9 @@
 # 🗺️ PathMan - Windows Environment Variable Manager
 
+[![CI](https://github.com/cumulus13/pathman/actions/workflows/ci.yml/badge.svg)](https://github.com/cumulus13/pathman/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/cumulus13/pathman/actions/workflows/codeql.yml/badge.svg)](https://github.com/cumulus13/pathman/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/cumulus13/pathman)](https://github.com/cumulus13/pathman/releases)
+
 Professional, production-ready CLI tool for managing Windows environment variables with style.
 
 ## ✨ Features
@@ -243,3 +247,15 @@ Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 [![Donate via Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/cumulus13)
  
 [Support me on Patreon](https://www.patreon.com/cumulus13)
+
+## 🤖 CI / Releases
+
+| Workflow | When | What |
+|---|---|---|
+| `ci.yml` | push / PR | portable tests (race), cross-compile win amd64/386/arm64, `go vet`, full tests on Windows, **end-to-end run against the real registry** (`.github/scripts/e2e.ps1`) |
+| `release.yml` | tag `v*` | tests, then GoReleaser builds zips + `checksums.txt` and publishes a GitHub Release. Manual run = snapshot build only |
+| `codeql.yml` | push / PR / weekly | CodeQL analysis |
+| `security.yml` | `go.mod` change / weekly | `govulncheck` |
+| `dependabot.yml` | weekly | Go modules + GitHub Actions updates |
+
+Release: `git tag v1.0.5 && git push origin v1.0.5`

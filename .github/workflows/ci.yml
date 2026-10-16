@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast, platform-neutral checks + cross-compile of every Windows target.
+  portable:
+    name: Portable tests + cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test platform-neutral packages (race)
+        run: go test -race -count=1 ./internal/config/... ./internal/backup/...
+      - name: Cross-compile and vet for Windows
+        run: |
+          for arch in amd64 386 arm64; do
+            echo "::group::windows/$arch"
+            GOOS=windows GOARCH=$arch go build -trimpath ./...
+            echo "::endgroup::"
+          done
+          GOOS=windows go vet ./...
+
+  # Real Windows: build, vet, full tests, then an end-to-end run against the
+  # runner's registry (throw-away PM_CI_* variables, temp backup folder).
+  windows:
+    name: Windows build, tests and e2e
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Verify modules
+        run: go mod verify
+      - name: Build
+        run: go build -trimpath -ldflags "-s -w" -o build/pathman.exe ./cmd/pathman
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 ./...
+      - name: End-to-end (registry, backup, restore)
+        shell: pwsh
+        run: ./.github/scripts/e2e.ps1 -Exe build/pathman.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pathman-windows-amd64
+          path: build/pathman.exe
+          retention-days: 7

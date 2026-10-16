@@ -1,37 +1,44 @@
-before:
-  hooks:
-    - go mod tidy
-    - go generate ./...
+version: 2
+project_name: pathman
 
 builds:
   - id: pathman
-    binary: pathman
     main: ./cmd/pathman
+    binary: pathman
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
     goos:
       - windows
     goarch:
       - amd64
-      - 386
-    ldflags:
-      - -s -w
-      - -X main.version={{.Version}}
-      - -X main.commit={{.Commit}}
-      - -X main.date={{.Date}}
+      - "386"
+      - arm64
 
 archives:
-  - format: zip
+  - id: zip
+    formats: [zip]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
       - LICENSE
 
-chocolatey:
-  - name: pathman
-    owners: YourName
-    title: PathMan
-    authors: YourName
-    project_url: https://github.com/cumulus13/pathman
-    license_url: https://github.com/cumulus13/pathman/blob/main/LICENSE
-    project_source_url: https://github.com/cumulus13/pathman
-    description: Professional Windows Environment Variable Manager
-    icon_url: https://raw.githubusercontent.com/cumulus13/pathman/main/assets/icon.png
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^version:"
+      - "^docs:"
+      - "^test:"
+      - "^Merge "
+
+release:
+  github:
+    owner: cumulus13
+    name: pathman

@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: # manual run builds a snapshot only (nothing is published)
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check tag against VERSION file
+        if: github.ref_type == 'tag'
+        run: |
+          file_ver=$(sed -n 's/.*"\(.*\)".*/\1/p' VERSION | head -n1)
+          tag_ver="${GITHUB_REF_NAME#v}"
+          if [ "$file_ver" != "$tag_ver" ]; then
+            echo "::warning::tag is $tag_ver but VERSION file says $file_ver"
+          fi
+
+      - name: Test and vet before releasing
+        run: |
+          go test -count=1 ./internal/config/... ./internal/backup/...
+          GOOS=windows go vet ./...
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build snapshot (manual run)
+        if: github.ref_type != 'tag'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean --skip=publish
+      - uses: actions/upload-artifact@v7
+        if: github.ref_type != 'tag'
+        with:
+          name: pathman-snapshot
+          path: dist/*.zip
+          retention-days: 7

@@ -28,3 +28,9 @@ CONVERSATIONS.md
 
 # Added entries (1 items)
 pathman.txt
+
+# Added entries (4 items)
+*.patch
+patch/
+download/
+downloads/

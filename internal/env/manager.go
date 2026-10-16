@@ -22,6 +22,22 @@ import (
 // Manager handles environment variable operations
 type Manager struct {
 	dryRun bool
+
+	// BeforeWrite, when set, runs right before every registry modification
+	// (Set, Delete, RestoreValue). If it returns an error the modification is
+	// NOT performed. The CLI uses it to take a backup first.
+	BeforeWrite func(scope Scope) error
+}
+
+// beforeWrite runs the hook; a failure aborts the write.
+func (m *Manager) beforeWrite(scope Scope) error {
+	if m.BeforeWrite == nil {
+		return nil
+	}
+	if err := m.BeforeWrite(scope); err != nil {
+		return fmt.Errorf("backup failed, nothing was changed: %w", err)
+	}
+	return nil
 }
 
 // NewManager creates a new environment variable manager
@@ -64,13 +80,26 @@ func (m *Manager) Set(name, value string, scope Scope) error {
 		return nil
 	}
 
+	if err := m.beforeWrite(scope); err != nil {
+		return err
+	}
+
+	// Keep the registry value type. PATH is normally REG_EXPAND_SZ; writing it
+	// back as REG_SZ would silently stop %SystemRoot%-style entries expanding.
+	expand := m.isExpandString(name, scope)
+
 	k, err := m.openKeyWrite(scope)
 	if err != nil {
 		return fmt.Errorf("failed to open registry for writing: %w", err)
 	}
 	defer k.Close()
 
-	if err := k.SetStringValue(name, value); err != nil {
+	if expand {
+		err = k.SetExpandStringValue(name, value)
+	} else {
+		err = k.SetStringValue(name, value)
+	}
+	if err != nil {
 		return fmt.Errorf("failed to set variable: %w", err)
 	}
 
@@ -110,6 +139,10 @@ func (m *Manager) BroadcastChange() error {
 func (m *Manager) Delete(name string, scope Scope) error {
 	if m.dryRun {
 		return nil
+	}
+
+	if err := m.beforeWrite(scope); err != nil {
+		return err
 	}
 
 	k, err := m.openKeyWrite(scope)

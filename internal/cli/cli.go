@@ -33,7 +33,6 @@ import (
 )
 
 var (
-	manager *env.Manager
 	rootCmd *cobra.Command
 	dryRun  bool
 	noColor bool
@@ -54,7 +53,6 @@ func copyToClipboard(text string) error {
 }
 
 func init() {
-	manager = env.NewManager(false)
 	rootCmd = &cobra.Command{
 		Use:   "pathman",
 		Short: "🗺️  Professional Windows Environment Variable Manager",
@@ -74,6 +72,8 @@ Features:
   • Non-existent path validation
   • JSON, YAML, CSV, Table output formats
   • Dry-run mode for safe testing
+  • Automatic verified backup before every change (+ 'backup restore')
+  • Config file (never read from the current directory)
   • Clipboard copy with -c/--clipboard
   • Instant terminal refresh with -r/--refresh
   • Temporary (current session only) with --temp
@@ -96,15 +96,23 @@ Examples:
 			if noColor {
 				color.NoColor = true
 			}
+			// arguments are valid at this point: runtime errors must not dump usage
+			cmd.SilenceUsage = true
+			currentAction = cmd.CommandPath()
 		},
 	}
+	// main() prints the error once; cobra must not print it a second time
+	rootCmd.SilenceErrors = true
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would be done without making changes")
 	rootCmd.PersistentFlags().BoolVar(&noColor, "no-color", false, "Disable colored output")
 	rootCmd.PersistentFlags().StringVarP(&format, "format", "f", "text", "Output format: text, json, yaml, csv, table")
+	rootCmd.PersistentFlags().StringVar(&cfgFlag, "config", "", "Config file (default: see 'pathman config --help'; never the current directory)")
+	rootCmd.PersistentFlags().StringVar(&backupDirFlag, "backup-dir", "", "Folder for automatic backups (overrides config file)")
+	rootCmd.PersistentFlags().BoolVar(&noBackupFlag, "no-backup", false, "Do not take an automatic backup before changing anything")
 	rootCmd.AddCommand(
 		getCmd(), setCmd(), appendCmd(), deleteCmd(),
 		pathCmd(), cleanCmd(), parseCmd(), removeValueCmd(),
-		infoCmd(), listCmd(), refreshCmd(), findCmd(), editCmd(),
+		infoCmd(), listCmd(), refreshCmd(), findCmd(), editCmd(), backupCmd(), configCmd(),
 	)
 }
 
@@ -191,7 +199,7 @@ Examples:
   pathman get "^PYTHON" --regex`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			pat := args[0]
 
 			// Determine scope(s) to search
@@ -259,7 +267,7 @@ Pattern matching is intentionally NOT supported for set — mass-overwrite is to
   -c/--clipboard copy new value to clipboard`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			scopeType := scopeFromString(scope)
 			varName := args[0]
 			value := strings.Join(args[1:], " ")
@@ -331,7 +339,7 @@ Pattern matching is NOT applied here — the variable name must be exact.
   --shell         Shell format for --temp: cmd (default) or powershell`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			scopeType := scopeFromString(scope)
 			appendPos := positionFromString(position)
 			varName := args[0]
@@ -436,7 +444,7 @@ Examples:
   pathman delete "^JAVA" --regex --confirm -s system`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			pat := args[0]
 			scopeType := scopeFromString(scope)
 
@@ -518,7 +526,7 @@ Examples:
   pathman list --value "C:\\Python*"
   pathman list --filter "*" --value "*mingw*" --regex`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			scopeStr := strings.ToLower(scope)
 
 			// Collect vars for requested scope(s)
@@ -740,7 +748,7 @@ Pattern matching is NOT applied here — the directory path must be literal.
   -c/--clipboard copy updated PATH to clipboard`,
 			Args: cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				m := env.NewManager(dryRun)
+				m := newManager()
 				scopeType := scopeFromString(scope)
 				appendPos := positionFromString(position)
 
@@ -819,7 +827,7 @@ Examples:
   pathman path remove "C:\\Python3[78]" --regex --confirm -s system`,
 			Args: cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				m := env.NewManager(dryRun)
+				m := newManager()
 				scopeType := scopeFromString(scope)
 				pat := args[0]
 
@@ -908,7 +916,7 @@ Examples:
   pathman path list --filter "C:\Python*"
   pathman path list --filter "mingw" --regex -s system`,
 			RunE: func(cmd *cobra.Command, args []string) error {
-				m := env.NewManager(dryRun)
+				m := newManager()
 				scopeType := scopeFromString(scope)
 				entries, err := m.PathList("PATH", scopeType)
 				if err != nil {
@@ -1009,7 +1017,7 @@ Examples:
   pathman parse "*" -f csv -s system`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			pat := args[0]
 			scopeType := scopeFromString(scope)
 
@@ -1055,7 +1063,7 @@ func cleanCmd() *cobra.Command {
 		Short:   fmt.Sprintf("%s Clean up PATH variable", ui.IconRefresh),
 		Long:    "Remove duplicates and non-existent paths from PATH",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			scopeType := scopeFromString(scope)
 			entries, err := m.PathList("PATH", scopeType)
 			if err != nil {
@@ -1157,7 +1165,7 @@ Examples:
   pathman remove-value PATH "Python3[78]" --regex --confirm`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			scopeType := scopeFromString(scope)
 			varName := args[0]
 			pat := args[1]
@@ -1261,7 +1269,7 @@ To update the current terminal, use --temp on append/path add:
   for /f "delims=" %i in ('pathman append PATH "C:\Tool" --temp') do @%i
   Invoke-Expression (pathman append PATH "C:\Tool" --temp --shell powershell)`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 
 			if dryRun {
 				fmt.Printf("%s %s\n", ui.IconInfo, ui.Info("Would refresh PATH from registry (dry-run)"))

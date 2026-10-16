@@ -36,8 +36,10 @@ type entryChange struct {
 //	at > 0       : replace entry number `at` with newVal (old is ignored)
 //	regex        : regexp.ReplaceAllString (supports $1 groups)
 //	glob pattern : whole entry replaced by newVal when it matches
-//	plain text   : case-insensitive substring replaced by newVal
-func applyEdit(parts []string, old, newVal string, useRegex bool, at int) ([]string, []entryChange, error) {
+//	contains     : case-insensitive substring replaced by newVal (opt-in)
+//	plain text   : (default) the WHOLE entry must equal old (case-insensitive,
+//	               trailing backslash ignored) and is replaced by newVal
+func applyEdit(parts []string, old, newVal string, useRegex, contains bool, at int) ([]string, []entryChange, error) {
 	out := make([]string, len(parts))
 	copy(out, parts)
 	var changes []entryChange
@@ -81,13 +83,21 @@ func applyEdit(parts []string, old, newVal string, useRegex bool, at int) ([]str
 			}
 			return newVal, true
 		}
-	default:
+	case contains:
 		re := regexp.MustCompile("(?i)" + regexp.QuoteMeta(old))
 		transform = func(s string) (string, bool) {
 			if !re.MatchString(s) {
 				return s, false
 			}
 			return re.ReplaceAllLiteralString(s, newVal), true
+		}
+	default:
+		want := normEntry(old)
+		transform = func(s string) (string, bool) {
+			if normEntry(s) != want {
+				return s, false
+			}
+			return newVal, true
 		}
 	}
 
@@ -103,9 +113,19 @@ func applyEdit(parts []string, old, newVal string, useRegex bool, at int) ([]str
 	return out, changes, nil
 }
 
+// normEntry normalizes a path entry for whole-entry comparison.
+func normEntry(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "/", `\`)
+	for len(s) > 3 && strings.HasSuffix(s, `\`) {
+		s = s[:len(s)-1]
+	}
+	return strings.ToLower(s)
+}
+
 func editCmd() *cobra.Command {
 	var scope string
-	var useRegex, confirm, refresh bool
+	var useRegex, contains, confirm, refresh bool
 	var at int
 
 	cmd := &cobra.Command{
@@ -115,17 +135,22 @@ func editCmd() *cobra.Command {
 		Long: `Change entries inside any ;-separated variable, in place (order is kept).
 
 Matching of <old>:
-  plain text   case-insensitive SUBSTRING is replaced by <new>
+  plain text   the WHOLE entry must equal <old> (case-insensitive, trailing \\
+               ignored) and is replaced by <new>. "C:\\SDK\\lua" will NOT touch
+               "C:\\SDK\\luarocks".
+  --contains   plain text matches a SUBSTRING of an entry instead
   glob         (* ? [abc]) the WHOLE entry is replaced by <new>
   --regex/-R   regexp replace, $1 $2 groups allowed in <new>
   --at N       replace entry number N (numbers shown by 'pathman find');
                usage: pathman edit VAR --at N <new>
 
 When more than one entry would change, --confirm is required.
-Use --dry-run to preview.
+Use --dry-run to preview. A backup is taken automatically before writing
+(see 'pathman backup --help').
 
 Examples:
-  pathman edit PATH Python38 Python312
+  pathman edit PATH "C:\\SDK\\lua" "C:\\SDK\\lua\\55"
+  pathman edit PATH Python38 Python312 --contains --confirm
   pathman edit PATH "C:\Python3*" "C:\Python312" --confirm
   pathman edit PATH "^C:\\Old(.*)" "D:\New$1" -R
   pathman edit PATH --at 4 "C:\Tools\bin" -s system
@@ -137,7 +162,7 @@ Examples:
 			return cobra.ExactArgs(3)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			m := env.NewManager(dryRun)
+			m := newManager()
 			sc := scopeFromString(scope)
 			varName := args[0]
 
@@ -155,7 +180,7 @@ Examples:
 			}
 
 			parts := strings.Split(v.Value, string(os.PathListSeparator))
-			out, changes, err := applyEdit(parts, old, newVal, useRegex, at)
+			out, changes, err := applyEdit(parts, old, newVal, useRegex, contains, at)
 			if err != nil {
 				fmt.Printf("%s %s\n", ui.IconError, ui.Error(err.Error()))
 				return err
@@ -166,6 +191,15 @@ Examples:
 				return nil
 			}
 
+			if dryRun {
+				for _, c := range changes {
+					fmt.Printf("%s %s #%d: %s %s %s\n", ui.IconInfo, ui.Info("Would change"), c.Index,
+						ui.Dim(c.Old), ui.Dim("→"), ui.Path(c.New))
+				}
+				fmt.Printf("%s %s\n", ui.IconInfo, ui.Info(fmt.Sprintf("Dry-run: %d entr(y/ies) would change, nothing written", len(changes))))
+				return nil
+			}
+
 			if len(changes) > 1 && !confirm {
 				fmt.Printf("%s %d entries in %s would change. Use --confirm to apply:\n",
 					ui.IconWarning, len(changes), ui.Highlight(varName))
@@ -173,14 +207,6 @@ Examples:
 					fmt.Printf("  #%-3d %s\n       %s %s\n", c.Index, ui.Dim(c.Old), ui.Dim("→"), ui.Path(c.New))
 				}
 				return fmt.Errorf("use --confirm to change %d entries", len(changes))
-			}
-
-			if dryRun {
-				for _, c := range changes {
-					fmt.Printf("%s %s #%d: %s %s %s\n", ui.IconInfo, ui.Info("Would change"), c.Index,
-						ui.Dim(c.Old), ui.Dim("→"), ui.Path(c.New))
-				}
-				return nil
 			}
 
 			newValue := env.NormalizePathSeparator(strings.Join(out, string(os.PathListSeparator)))
@@ -204,6 +230,7 @@ Examples:
 	cmd.Flags().StringVarP(&scope, "scope", "s", "user", "Scope: user or system")
 	cmd.Flags().BoolVarP(&useRegex, "regex", "R", false, "Treat <old> as regex ($1 groups allowed in <new>)")
 	cmd.Flags().IntVar(&at, "at", 0, "Replace entry number N (1-based, as shown by 'find')")
+	cmd.Flags().BoolVar(&contains, "contains", false, "Plain text matches a SUBSTRING of an entry instead of the whole entry")
 	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm when more than one entry changes")
 	cmd.Flags().BoolVarP(&refresh, "refresh", "r", false, "Broadcast WM_SETTINGCHANGE after writing")
 	return cmd

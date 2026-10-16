@@ -96,19 +96,62 @@ pathman get PATH -f json > path.json
 pathman list -f json | jq .
 ```
 
+### Automatic backup & restore
+
+Before **every** change (`set`, `delete`, `append`, `edit`, `remove-value`, `path add/remove`, `clean`, `backup restore`, ...) pathman saves a verified snapshot of the affected scope (user or system). If the snapshot cannot be written, **the change is not made**. Snapshots keep the registry value type, so `REG_EXPAND_SZ` entries like `%SystemRoot%\system32` survive.
+
+```
+pathman backup list                     # newest first
+pathman backup create -s system         # manual snapshot
+pathman backup restore latest           # show what would change
+pathman backup restore latest --confirm # apply
+pathman backup restore latest --var PATH --confirm
+pathman backup dir                      # where backups live
+
+pathman edit PATH Foo Bar --no-backup   # skip the backup for one run
+pathman set X 1 --backup-dir D:\bk      # use another folder for one run
+```
+
+Default backup folder: Windows `%LOCALAPPDATA%\pathman\backups`, macOS `~/Library/Application Support/pathman/backups`, Linux `$XDG_STATE_HOME` or `~/.local/state/pathman/backups`.
+Backups contain your variable values - keep the folder private.
+
+### Config file
+
+```
+pathman config init      # write a default config
+pathman config show      # effective settings + where each value came from
+pathman config path
+```
+
+The config file is **never** read from the current directory, so results do not depend on where you run pathman. Lookup order: `--config FILE` -> `$PATHMAN_CONFIG` -> `<folder of pathman.exe>\pathman.json` -> `%AppData%\pathman\config.json` -> built-in defaults. A broken config is an error (never silently ignored) and blocks changes until fixed; unknown keys are rejected.
+
+```json
+{
+  "backup": {
+    "enabled": true,
+    "dir": "D:\\Backups\\pathman",
+    "keep": 100
+  }
+}
+```
+
+`dir` accepts `%VAR%`, `$VAR`, `~`; a relative `dir` is relative to the config file's folder. `keep` = backups retained (`0` = keep all; only pathman's own snapshot files are ever pruned).
+Backup folder precedence: `--backup-dir` > `$PATHMAN_BACKUP_DIR` > config `backup.dir` > OS default.
+
 ### Edit entries inside a variable
 
 Works on any `;`-separated variable (PATH, PATHEXT, PYTHONPATH, ...), keeps entry order.
 
 ```
-pathman edit PATH Python38 Python312               # substring replace
-pathman edit PATH "C:\\Python3*" "C:\\Py312" --confirm # glob: whole entry replaced
-pathman edit PATH "^C:\\Old(.*)" "D:\\New$1" -R        # regex with groups
-pathman edit PATH --at 4 "C:\\Tools\\bin" -s system     # replace entry #4 (numbers from `find`)
-pathman edit PYTHONPATH "C:\\lib" "D:\\lib" --dry-run   # preview
+pathman edit PATH "C:\SDK\lua" "C:\SDK\lua\55"      # whole-entry match (won't touch C:\SDK\luarocks)
+pathman edit PATH Python38 Python312 --contains    # substring replace
+pathman edit PATH "C:\Python3*" "C:\Py312" --confirm # glob: whole entry replaced
+pathman edit PATH "^C:\\Old(.*)" "D:\New$1" -R        # regex with groups
+pathman edit PATH --at 4 "C:\Tools\bin" -s system     # replace entry #4 (numbers from `find`)
+pathman edit PYTHONPATH "C:\lib" "D:\lib" --dry-run   # preview
 
-pathman remove-value PATH "C:\\Old*" --confirm    # delete entries (any variable)
-pathman append PATH "C:\\New" -p pre              # add entry (front/end)
+pathman remove-value PATH "C:\Old*" --confirm    # delete entries (any variable)
+pathman append PATH "C:\New" -p pre              # add entry (front/end)
 ```
 
 ### Find
@@ -119,14 +162,14 @@ pathman find python
 
 # Search inside ONE variable only
 pathman find python -e PATH
-pathman find "C:\\Program Files*" -e PATH -s system
+pathman find "C:\Program Files*" -e PATH -s system
 
 # Restrict what is searched: name | value | entry
 pathman find java --in name
-pathman find "C:\\Go*" --in value
+pathman find "C:\Go*" --in value
 
 # Glob / regex
-pathman find "C:\\Python3*"
+pathman find "C:\Python3*"
 pathman find "^C:\\Go" -R -e PATH
 
 # Flag PATH entries whose directory no longer exists

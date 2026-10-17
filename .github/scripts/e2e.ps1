@@ -133,6 +133,9 @@ finally {
         reg delete 'HKCU\Environment' /v $v /f 2>$null | Out-Null
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    # `reg delete` of a variable that was never created exits 1; the CI shell would
+    # report that stale code as the script result.
+    $global:LASTEXITCODE = 0
 }
 
 if ($script:failed -gt 0) {
@@ -140,3 +143,4 @@ if ($script:failed -gt 0) {
     exit 1
 }
 Write-Host "`nAll e2e checks passed"
+exit 0

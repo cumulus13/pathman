@@ -19,9 +19,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      # govulncheck (and the stdlib vulnerability data it reports on) tracks the
+      # newest Go release, which can be newer than the go.mod minimum - so scan
+      # with the latest stable toolchain rather than the one from go.mod.
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: Scan

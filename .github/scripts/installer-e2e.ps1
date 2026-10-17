@@ -117,3 +117,4 @@ if ($script:failed -gt 0) {
     exit 1
 }
 Write-Host "`nAll installer checks passed"
+exit 0

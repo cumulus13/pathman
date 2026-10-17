@@ -19,6 +19,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install NSIS (for the Windows installers)
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends nsis
+
       - name: Check tag against VERSION file
         if: github.ref_type == 'tag'
         run: |
@@ -54,5 +57,7 @@ jobs:
         if: github.ref_type != 'tag'
         with:
           name: pathman-snapshot
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*_setup.exe
           retention-days: 7

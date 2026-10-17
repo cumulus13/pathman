@@ -5,6 +5,12 @@ import (
 	"strings"
 )
 
+// enabled controls whether any ANSI escape codes are emitted.
+var enabled = true
+
+// SetColor turns colored output on or off (used by --no-color and NO_COLOR).
+func SetColor(on bool) { enabled = on }
+
 // hexColor creates a color function from hex string using raw ANSI codes
 func hexColor(hex string, bold bool) func(a ...interface{}) string {
 	hex = strings.TrimPrefix(hex, "#")
@@ -17,7 +23,11 @@ func hexColor(hex string, bold bool) func(a ...interface{}) string {
 	}
 	
 	return func(a ...interface{}) string {
-		return prefix + fmt.Sprint(a...) + "\033[0m"
+		text := fmt.Sprint(a...)
+		if !enabled {
+			return text
+		}
+		return prefix + text + "\033[0m"
 	}
 }
 

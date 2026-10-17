@@ -248,12 +248,31 @@ Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
  
 [Support me on Patreon](https://www.patreon.com/cumulus13)
 
+## 📦 Installer (Windows)
+
+Each release ships `pathman_<version>_windows_<arch>_setup.exe` for `amd64`, `386` and `arm64` (plus the plain `.zip`).
+
+```
+pathman_1.0.5_windows_amd64_setup.exe            # interactive
+pathman_1.0.5_windows_amd64_setup.exe /S         # silent
+pathman_1.0.5_windows_amd64_setup.exe /S /D=C:\Tools\PathMan   # silent, custom folder (/D= must be last, no quotes)
+"C:\Program Files\PathMan\uninstall.exe" /S     # silent uninstall
+```
+
+- Installs to `C:\Program Files\PathMan` (needs administrator), registers in *Apps & features*, optional **Add to system PATH** component (on by default).
+- PATH is changed by `pathman.exe path add/remove` itself, not by the installer script: no length limit, registry type (`REG_EXPAND_SZ`) is preserved, and an automatic backup of the system environment is taken first (`pathman backup list`).
+- Uninstall removes only its own PATH entry and files; your backups are kept.
+- Install folders containing `;  [  ]` are refused (they would corrupt or mis-match PATH entries).
+- Build it yourself: `makensis -DVERSION=1.0.5 -DVERSION_NUM=1.0.5.0 -DARCH=amd64 -DEXE=<abs path to pathman.exe> -DSRCDIR=<abs repo root> -DOUTFILE=<abs out.exe> installer/pathman.nsi`
+
+> **Debian / Alpine:** PathMan manages the Windows registry and does not build for Linux, so there are no `.deb` / `.apk` packages.
+
 ## 🤖 CI / Releases
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | push / PR | portable tests (race), cross-compile win amd64/386/arm64, `go vet`, full tests on Windows, **end-to-end run against the real registry** (`.github/scripts/e2e.ps1`) |
-| `release.yml` | tag `v*` | tests, then GoReleaser builds zips + `checksums.txt` and publishes a GitHub Release. Manual run = snapshot build only |
+| `ci.yml` | push / PR | portable tests (race), cross-compile win amd64/386/arm64, `go vet`, full tests on Windows, **end-to-end run against the real registry** (`.github/scripts/e2e.ps1`), installer build + real install/upgrade/uninstall (`.github/scripts/installer-e2e.ps1`) |
+| `release.yml` | tag `v*` | tests, then GoReleaser builds zips + **NSIS installers** (amd64/386/arm64) + `checksums.txt` and publishes a GitHub Release. Manual run = snapshot build only |
 | `codeql.yml` | push / PR / weekly | CodeQL analysis |
 | `security.yml` | `go.mod` change / weekly | `govulncheck` |
 | `dependabot.yml` | weekly | Go modules + GitHub Actions updates |

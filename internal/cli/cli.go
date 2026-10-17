@@ -93,8 +93,10 @@ Examples:
   pathman path remove "C:\Python3[78]*" --regex`,
 		Version: "1.0.0",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			if noColor {
+			// --no-color or the NO_COLOR convention (https://no-color.org)
+			if noColor || os.Getenv("NO_COLOR") != "" {
 				color.NoColor = true
+				ui.SetColor(false)
 			}
 			// arguments are valid at this point: runtime errors must not dump usage
 			cmd.SilenceUsage = true

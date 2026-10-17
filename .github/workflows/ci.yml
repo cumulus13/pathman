@@ -62,3 +62,44 @@ jobs:
           name: pathman-windows-amd64
           path: build/pathman.exe
           retention-days: 7
+
+  # Build the NSIS installers (warnings are errors) ...
+  installer-build:
+    name: Build installers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install NSIS
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends nsis
+      - name: Build pathman.exe and installers (amd64, 386, arm64)
+        run: |
+          mkdir -p build/bin build/installers
+          for arch in amd64 386 arm64; do
+            GOOS=windows GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/bin/$arch/pathman.exe ./cmd/pathman
+            makensis -V2 -WX               -DVERSION=0.0.0-ci -DVERSION_NUM=0.0.0.0 -DARCH=$arch               -DEXE="$PWD/build/bin/$arch/pathman.exe" -DSRCDIR="$PWD"               -DOUTFILE="$PWD/build/installers/pathman_0.0.0-ci_windows_${arch}_setup.exe"               installer/pathman.nsi
+          done
+          ls -la build/installers
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers
+          path: build/installers/*.exe
+          retention-days: 7
+
+  # ... and really install / upgrade / uninstall them on Windows.
+  installer-e2e:
+    name: Installer end-to-end (Windows)
+    needs: installer-build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: installers
+          path: installers
+      - name: Install, upgrade, uninstall
+        shell: pwsh
+        run: ./.github/scripts/installer-e2e.ps1 -SetupDir installers
+

@@ -17,6 +17,20 @@ builds:
       - amd64
       - "386"
       - arm64
+    hooks:
+      # One NSIS installer per architecture (needs `makensis` on PATH).
+      # {{ .Path }} is absolute (<repo>/dist/<target>/pathman.exe); NSIS resolves
+      # relative paths from installer/, so every path is passed absolute.
+      post:
+        - cmd: >-
+            makensis -V2 -WX
+            -DVERSION={{ .Version }}
+            -DVERSION_NUM={{ .Major }}.{{ .Minor }}.{{ .Patch }}.0
+            -DARCH={{ .Arch }}
+            -DEXE={{ .Path }}
+            -DSRCDIR={{ dir (dir (dir .Path)) }}
+            -DOUTFILE={{ dir (dir .Path) }}/pathman_{{ .Version }}_windows_{{ .Arch }}_setup.exe
+            installer/pathman.nsi
 
 archives:
   - id: zip
@@ -28,6 +42,8 @@ archives:
 
 checksum:
   name_template: checksums.txt
+  extra_files:
+    - glob: dist/*_setup.exe
 
 changelog:
   sort: asc
@@ -42,3 +58,5 @@ release:
   github:
     owner: cumulus13
     name: pathman
+  extra_files:
+    - glob: dist/*_setup.exe
